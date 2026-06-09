@@ -24,6 +24,14 @@ type ExtractionResult = {
   patch: Partial<CompanyAccountFormValues>;
 };
 
+type TextPayload = {
+  extractable: boolean;
+  findings: PrefillFinding[];
+  patch: Partial<CompanyAccountFormValues>;
+  parseNote: string;
+  text: string;
+};
+
 const readableMimeTypes = new Set([
   "application/json",
   "application/pdf",
@@ -129,6 +137,8 @@ const prefillRules: {
 const normalizeWhitespace = (value: string) =>
   value.replace(/\s+/g, " ").replace(/[ ]+([,.;:])/g, "$1").trim();
 
+const minRecognizedTextLength = 12;
+
 const cleanMatchValue = (value: string) =>
   normalizeWhitespace(value)
     .replace(/^[-:：]+/, "")
@@ -144,6 +154,11 @@ const detectFileExtension = (name: string) => {
   const parts = name.toLowerCase().split(".");
   return parts.length > 1 ? parts.at(-1) ?? "" : "";
 };
+
+let ocrWorkerPromise: Promise<{
+  recognize: (image: string | File) => Promise<{ data: { text: string } }>;
+  setParameters: (params: Record<string, string>) => Promise<unknown>;
+}> | null = null;
 
 const isImageLikeFile = (file: File) => {
   if (file.type.startsWith("image/")) {
@@ -163,6 +178,154 @@ const isReadableFile = (file: File) => {
   return ["csv", "json", "md", "pdf", "txt"].includes(
     detectFileExtension(file.name),
   );
+};
+
+const getOcrWorker = async () => {
+  if (!ocrWorkerPromise) {
+    ocrWorkerPromise = (async () => {
+      const { createWorker } = await import("tesseract.js");
+      const worker = await createWorker(["eng", "chi_sim"], 1, {
+        logger: () => undefined,
+      });
+
+      await worker.setParameters({
+        preserve_interword_spaces: "1",
+        user_defined_dpi: "300",
+      });
+
+      return worker;
+    })().catch((error) => {
+      ocrWorkerPromise = null;
+      throw error;
+    });
+  }
+
+  return ocrWorkerPromise;
+};
+
+const recognizeImageText = async (image: string | File) => {
+  const worker = await getOcrWorker();
+  const result = await worker.recognize(image);
+  return normalizeWhitespace(result.data.text);
+};
+
+const renderPdfPageToImage = async (file: File, pageNumber: number) => {
+  if (typeof document === "undefined") {
+    throw new Error("OCR rendering is only available in the browser.");
+  }
+
+  const { getDocument } = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const data = new Uint8Array(await file.arrayBuffer());
+  const pdf = await getDocument({ data } as never).promise;
+  const page = await pdf.getPage(pageNumber);
+  const viewport = page.getViewport({ scale: 2 });
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+
+  if (!context) {
+    throw new Error("Canvas context is unavailable.");
+  }
+
+  canvas.width = Math.ceil(viewport.width);
+  canvas.height = Math.ceil(viewport.height);
+
+  await page.render({
+    canvas,
+    canvasContext: context,
+    viewport,
+  }).promise;
+
+  return canvas.toDataURL("image/png");
+};
+
+const extractImageTextWithOcr = async (file: File): Promise<TextPayload> => {
+  try {
+    const text = await recognizeImageText(file);
+    const normalizedText = normalizeWhitespace(text);
+    const hasText = normalizedText.replace(/\s/g, "").length >= minRecognizedTextLength;
+
+    return {
+      extractable: hasText,
+      findings: [],
+      patch: {},
+      parseNote: hasText
+        ? "已完成图片 OCR，并纳入自动预填写。"
+        : "已完成图片 OCR，但未识别到可用文本，原件已保留。",
+      text: normalizedText,
+    };
+  } catch (error) {
+    return {
+      extractable: false,
+      findings: [],
+      patch: {},
+      parseNote:
+        error instanceof Error
+          ? `图片 OCR 启动失败，已保存原件：${error.message}`
+          : "图片 OCR 启动失败，已保存原件。",
+      text: "",
+    };
+  }
+};
+
+const extractPdfTextWithOcr = async (file: File): Promise<TextPayload> => {
+  try {
+    const text = await extractPdfText(file);
+    const normalizedText = normalizeWhitespace(text);
+    const hasReadableText =
+      normalizedText.replace(/\s/g, "").length >= minRecognizedTextLength;
+
+    if (hasReadableText) {
+      return {
+        extractable: true,
+        findings: [],
+        patch: {},
+        parseNote: "已提取 PDF 文本并完成首轮字段匹配。",
+        text: normalizedText,
+      };
+    }
+
+    const pageImages: string[] = [];
+    const { getDocument } = await import("pdfjs-dist/legacy/build/pdf.mjs");
+    const data = new Uint8Array(await file.arrayBuffer());
+    const pdf = await getDocument({ data } as never).promise;
+    const pageLimit = Math.min(pdf.numPages, 3);
+
+    for (let index = 1; index <= pageLimit; index += 1) {
+      pageImages.push(await renderPdfPageToImage(file, index));
+    }
+
+    const ocrChunks: string[] = [];
+    for (const image of pageImages) {
+      const chunk = await recognizeImageText(image);
+      if (chunk) {
+        ocrChunks.push(chunk);
+      }
+    }
+
+    const ocrText = normalizeWhitespace(ocrChunks.join("\n"));
+    const hasOcrText = ocrText.replace(/\s/g, "").length >= minRecognizedTextLength;
+
+    return {
+      extractable: hasOcrText,
+      findings: [],
+      patch: {},
+      parseNote: hasOcrText
+        ? "PDF 原文不可提取，已改用页面 OCR 并纳入自动预填写。"
+        : "PDF 原文不可提取，已尝试页面 OCR，但未识别到可用文本。",
+      text: ocrText,
+    };
+  } catch (error) {
+    return {
+      extractable: false,
+      findings: [],
+      patch: {},
+      parseNote:
+        error instanceof Error
+          ? `PDF OCR 处理失败，已保存原件：${error.message}`
+          : "PDF OCR 处理失败，已保存原件。",
+      text: "",
+    };
+  }
 };
 
 const extractPdfText = async (file: File) => {
@@ -216,7 +379,7 @@ const extractJsonPatch = async (file: File) => {
   return { findings, patch, raw };
 };
 
-const extractTextPayload = async (file: File) => {
+const extractTextPayload = async (file: File): Promise<TextPayload> => {
   if (file.type === "application/json" || detectFileExtension(file.name) === "json") {
     const result = await extractJsonPatch(file);
     return {
@@ -229,14 +392,7 @@ const extractTextPayload = async (file: File) => {
   }
 
   if (file.type === "application/pdf" || detectFileExtension(file.name) === "pdf") {
-    const text = await extractPdfText(file);
-    return {
-      extractable: true,
-      findings: [] as PrefillFinding[],
-      patch: {} as Partial<CompanyAccountFormValues>,
-      parseNote: "已提取 PDF 文本并完成首轮字段匹配。",
-      text,
-    };
+    return extractPdfTextWithOcr(file);
   }
 
   if (isReadableFile(file)) {
@@ -251,20 +407,14 @@ const extractTextPayload = async (file: File) => {
   }
 
   if (isImageLikeFile(file)) {
-    return {
-      extractable: false,
-      findings: [] as PrefillFinding[],
-      patch: {} as Partial<CompanyAccountFormValues>,
-      parseNote: "已接收图像资料，当前版本先保存原件；自动摘取以文字型资料优先。",
-      text: "",
-    };
+    return extractImageTextWithOcr(file);
   }
 
   return {
     extractable: false,
     findings: [] as PrefillFinding[],
     patch: {} as Partial<CompanyAccountFormValues>,
-    parseNote: "当前版本未启用图片 OCR，该资料将保留原件但不自动预填。",
+    parseNote: "当前资料类型只做原件保存，不参与自动预填。",
     text: "",
   };
 };

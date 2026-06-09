@@ -371,6 +371,7 @@ function MaterialRequirementCell({
   onUpload: (event: ChangeEvent<HTMLInputElement>) => void;
   onClear: () => void;
 }) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
   const meta = applicabilityMeta[requirement.applicability];
   const isGenerated = Boolean(requirement.generated);
   const hasDocuments = documents.length > 0;
@@ -455,7 +456,9 @@ function MaterialRequirementCell({
           </span>
         ) : (
           <div className="flex shrink-0 items-center gap-2 xl:self-start">
-            <label
+            <button
+              type="button"
+              onClick={() => inputRef.current?.click()}
               className={`inline-flex min-h-10 cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-xs font-medium transition ${
                 uploading
                   ? "border-slate-200 bg-slate-100 text-slate-500"
@@ -463,6 +466,7 @@ function MaterialRequirementCell({
                     ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:border-emerald-300"
                     : "border-slate-300 bg-white text-slate-700 hover:border-slate-400"
               }`}
+              disabled={uploading}
             >
               {uploading ? (
                 <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
@@ -470,15 +474,16 @@ function MaterialRequirementCell({
                 <Upload className="h-3.5 w-3.5" />
               )}
               {uploading ? "上传中" : "上传文件"}
-              <input
-                type="file"
-                multiple
-                onChange={onUpload}
-                className="hidden"
-                accept={uploadAccept}
-                disabled={uploading}
-              />
-            </label>
+            </button>
+            <input
+              ref={inputRef}
+              type="file"
+              multiple
+              onChange={onUpload}
+              className="sr-only"
+              accept={uploadAccept}
+              disabled={uploading}
+            />
             {hasDocuments ? (
               <button
                 type="button"
@@ -893,8 +898,6 @@ export default function Home() {
       } else {
         setStatusMessage(`${requirement.label} 已更新，当前仅保存在本地页面`);
       }
-
-      setActiveStep("company");
     } catch (error) {
       setErrorMessage(
         error instanceof Error ? error.message : "资料解析失败，请稍后重试。",
