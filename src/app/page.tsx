@@ -5,20 +5,25 @@ import {
   AlertCircle,
   ArrowRight,
   BadgeCheck,
+  Building2,
   CheckCircle2,
   ChevronRight,
   ClipboardCheck,
-  FileArchive,
+  Database,
+  FileCheck2,
   FilePenLine,
   FileSearch,
   LoaderCircle,
   PenSquare,
   RefreshCcw,
+  ScanSearch,
+  Send,
   ShieldCheck,
   Sparkles,
   Upload,
 } from "lucide-react";
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -39,7 +44,9 @@ import {
   entityTypeOptions,
   experienceRows,
   fundingSourceOptions,
+  initialUploadMaterialRequirements,
   investmentObjectiveOptions,
+  materialRequirements,
   previewDeck,
   sourceRegionOptions,
   steps,
@@ -51,14 +58,27 @@ import {
   type ExperienceKey,
   type FundingSourceKey,
   type InvestmentObjectiveKey,
+  type MaterialApplicability,
+  type MaterialRequirement,
+  type MaterialRequirementKey,
   type PrefillFinding,
+  type SubmissionStatus,
   type StepId,
   type UploadedDocument,
 } from "@/lib/company-account-schema";
 import {
+  deriveSubmissionStatus,
+  fetchBackendStatus,
+  saveDraftSubmission,
+  uploadSubmissionDocuments,
+  uploadSubmissionPdf,
+} from "@/lib/submission-client";
+import type { SubmissionRecord } from "@/lib/submission-payload";
+import {
+  coreMaterialRequirementKeys,
   countCompletedExperiences,
   createInitialFormValues,
-  extractDocumentData,
+  extractDocumentDataWithContext,
   formatBytes,
   getFirstIncompleteStep,
   getMissingItems,
@@ -78,37 +98,31 @@ const stepCards: Record<
   }
 > = {
   upload: {
-    title: "把原始资料先收全",
-    description: "上传商业登记、公司注册文件、联络资料或已有客户清单，系统先做首轮摘取。",
+    title: "先收齐支持文件",
+    description: "按材料清单逐项上传，系统先保存原件，并对文字型资料做首轮自动摘取。",
     icon: Upload,
   },
   company: {
-    title: "把开户必填项补齐",
-    description: "先锁定公司资料、账户类型、通讯方式和开户编号，保证生成版 PDF 有完整骨架。",
-    icon: FilePenLine,
+    title: "整理自动摘取结果",
+    description: "把 OCR / 文本解析命中的字段集中展示，确认哪些已经可预填写，哪些还要人工补。",
+    icon: ScanSearch,
   },
   funding: {
-    title: "把风险与资金部分电子化",
-    description: "资金来源、投资目标、经验矩阵和授权人信息都在这一段完成，直接对应原始表格页码。",
-    icon: ShieldCheck,
+    title: "检查并补全开户信息",
+    description: "把公司资料、账户类型、资金来源、授权人和风险经验一次补齐，准备生成申请文件。",
+    icon: FilePenLine,
   },
   review: {
-    title: "先出复核版，再决定回退点",
-    description: "生成与原始表格一致的 PDF 草稿，让客户逐页核对，不对的地方直接退回修改。",
-    icon: FileSearch,
-  },
-  sign: {
-    title: "确认无误后电子签名",
-    description: "签署人、见证人和签名图像会落回模板固定位置，最后导出签署版 PDF。",
+    title: "生成 PDF 并签署",
+    description: "先出复核版，再完成电子签名并导出签署版 PDF，作为最终开户申请文件。",
     icon: PenSquare,
   },
+  sign: {
+    title: "确认材料包并发送后台",
+    description: "把支持文件和签署版申请文件整合成完整材料包，确认后提交到后端数据库。",
+    icon: Send,
+  },
 };
-
-const metrics = [
-  { label: "原表页数", value: "13", accent: "from-amber-500/35 to-orange-500/10" },
-  { label: "内置字段", value: "10", accent: "from-emerald-500/35 to-teal-500/10" },
-  { label: "关键签署位", value: "4", accent: "from-rose-500/35 to-pink-500/10" },
-];
 
 const textInputClassName =
   "min-h-11 w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/15";
@@ -118,6 +132,56 @@ const textareaClassName =
 
 const panelClassName =
   "rounded-lg border border-white/70 bg-white/88 shadow-[0_24px_60px_-40px_rgba(15,23,42,0.38)] backdrop-blur";
+
+const autosaveDelayMs = 900;
+const uploadAccept =
+  ".pdf,.txt,.csv,.md,.markdown,.json,.jpg,.jpeg,.png,.webp,.heic,.heif,image/*";
+
+const applicabilityMeta: Record<
+  MaterialApplicability,
+  { label: string; className: string }
+> = {
+  all: {
+    label: "通用",
+    className: "bg-slate-100 text-slate-600",
+  },
+  generated: {
+    label: "系统生成",
+    className: "bg-amber-100 text-amber-700",
+  },
+  hongKongOnly: {
+    label: "香港公司",
+    className: "bg-sky-100 text-sky-700",
+  },
+  overseasOnly: {
+    label: "海外公司",
+    className: "bg-violet-100 text-violet-700",
+  },
+  highRiskOnly: {
+    label: "高风险客户",
+    className: "bg-rose-100 text-rose-700",
+  },
+  professionalInvestorOnly: {
+    label: "专业投资者",
+    className: "bg-emerald-100 text-emerald-700",
+  },
+};
+
+const buildInitialFormValues = () => {
+  const initial = createInitialFormValues();
+  initial.intakeDate = todayString();
+  initial.declarationDate = todayString();
+  return initial;
+};
+
+const formatSyncTime = (value: string) =>
+  new Intl.DateTimeFormat("zh-HK", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date(value));
 
 const toggleArrayValue = <T extends string>(items: T[], value: T) =>
   items.includes(value) ? items.filter((item) => item !== value) : [...items, value];
@@ -162,9 +226,7 @@ function SectionHeading({
         {eyebrow}
       </span>
       <h2 className="text-xl font-semibold text-slate-950 sm:text-2xl">{title}</h2>
-      <p className="max-w-3xl text-sm leading-7 text-slate-600 sm:text-[15px]">
-        {body}
-      </p>
+      <p className="max-w-3xl text-sm leading-7 text-slate-600 sm:text-[15px]">{body}</p>
     </div>
   );
 }
@@ -283,12 +345,8 @@ function StepRail({
                 </span>
                 <span className="truncate text-sm font-semibold">{step.label}</span>
               </div>
-              <p
-                className={`text-xs leading-5 ${
-                  active ? "text-white/72" : "text-slate-500"
-                }`}
-              >
-                {stepCard.description}
+              <p className={`text-xs leading-5 ${active ? "text-white/72" : "text-slate-500"}`}>
+                {steps[index]?.hint}
               </p>
             </div>
           </button>
@@ -298,89 +356,139 @@ function StepRail({
   );
 }
 
-function DocumentList({
+function MaterialRequirementCell({
+  requirement,
   documents,
-  findings,
+  generatedReady,
+  uploading,
+  onUpload,
+  onClear,
 }: {
+  requirement: MaterialRequirement;
   documents: UploadedDocument[];
-  findings: PrefillFinding[];
+  generatedReady: boolean;
+  uploading: boolean;
+  onUpload: (event: ChangeEvent<HTMLInputElement>) => void;
+  onClear: () => void;
 }) {
-  if (documents.length === 0) {
-    return (
-      <div className="rounded-xl border border-dashed border-slate-300 bg-white/70 px-5 py-8 text-sm text-slate-500">
-        还没有上传资料。可直接拖入 PDF、TXT、CSV、Markdown 或 JSON。
-      </div>
-    );
-  }
+  const meta = applicabilityMeta[requirement.applicability];
+  const isGenerated = Boolean(requirement.generated);
+  const hasDocuments = documents.length > 0;
+  const showComplete = isGenerated ? generatedReady : hasDocuments;
+  const extractableCount = documents.filter((document) => document.extractable).length;
 
   return (
-    <div className="grid gap-4 lg:grid-cols-[1.15fr_0.85fr]">
-      <div className="grid gap-3">
-        {documents.map((document) => (
-          <div
-            key={document.id}
-            className="rounded-xl border border-slate-200 bg-white px-4 py-4 shadow-sm"
-          >
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <div className="flex items-center gap-2">
-                  <span className="inline-flex h-8 w-8 items-center justify-center rounded-lg bg-amber-100 text-amber-700">
-                    <FileArchive className="h-4 w-4" />
-                  </span>
-                  <div className="min-w-0">
-                    <p className="truncate text-sm font-semibold text-slate-900">
-                      {document.name}
-                    </p>
-                    <p className="text-xs text-slate-500">
-                      {formatBytes(document.size)} ·{" "}
-                      {document.extractable ? "已参与预填" : "仅保存原件"}
-                    </p>
-                  </div>
-                </div>
-              </div>
+    <div className="h-full bg-white px-4 py-4 lg:px-5">
+      <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-start gap-2">
+            <p className="text-[15px] font-medium leading-7 text-slate-900">
+              {requirement.label}
+            </p>
+            <span
+              className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-medium ${meta.className}`}
+            >
+              {meta.label}
+            </span>
+          </div>
+          {requirement.note ? (
+            <p className="mt-1 text-xs leading-5 text-slate-500">{requirement.note}</p>
+          ) : null}
+
+          {isGenerated ? (
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
               <span
-                className={`inline-flex rounded-full px-2.5 py-1 text-[11px] font-medium ${
-                  document.extractable
+                className={`inline-flex rounded-full px-2 py-0.5 font-medium ${
+                  generatedReady
                     ? "bg-emerald-50 text-emerald-700"
-                    : "bg-slate-100 text-slate-500"
+                    : "bg-amber-50 text-amber-700"
                 }`}
               >
-                {document.extractable ? "extractable" : "manual"}
+                {generatedReady ? "签署版已入包" : "第4步生成"}
               </span>
+              <span>系统自动生成，不需要首步上传。</span>
             </div>
-            <p className="mt-3 text-xs leading-5 text-slate-500">{document.parseNote}</p>
-            {document.extractedTextSample ? (
-              <p className="mt-2 rounded-lg bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-600">
-                {document.extractedTextSample}
-              </p>
-            ) : null}
-          </div>
-        ))}
-      </div>
-
-      <div className="rounded-xl border border-slate-200 bg-slate-950 px-4 py-4 text-white">
-        <div className="mb-3 flex items-center gap-2">
-          <Sparkles className="h-4 w-4 text-amber-300" />
-          <h3 className="text-sm font-semibold">自动预填命中</h3>
+          ) : hasDocuments ? (
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+              <span className="inline-flex rounded-full bg-emerald-50 px-2 py-0.5 font-medium text-emerald-700">
+                已上传 {documents.length} 份
+              </span>
+              {extractableCount > 0 ? (
+                <span className="inline-flex rounded-full bg-sky-50 px-2 py-0.5 font-medium text-sky-700">
+                  {extractableCount} 份可预填
+                </span>
+              ) : null}
+              {documents.slice(0, 2).map((document) => (
+                <span
+                  key={document.id}
+                  className="max-w-[260px] truncate rounded-full bg-slate-100 px-2 py-0.5 text-slate-700"
+                  title={`${document.name} · ${formatBytes(document.size)}`}
+                >
+                  {document.name}
+                </span>
+              ))}
+              {documents.length > 2 ? (
+                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-700">
+                  +{documents.length - 2} 份
+                </span>
+              ) : null}
+            </div>
+          ) : (
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+              <span className="inline-flex rounded-full bg-slate-100 px-2 py-0.5 font-medium text-slate-600">
+                未上传
+              </span>
+              <span>支持 PDF、图片、TXT、CSV、Markdown、JSON。</span>
+            </div>
+          )}
         </div>
-        {findings.length === 0 ? (
-          <p className="text-sm leading-6 text-white/68">
-            目前还没有命中字段。上传文字型资料后，这里会列出“从哪份资料提取了哪项信息”。
-          </p>
+
+        {isGenerated ? (
+          <span
+            className={`inline-flex min-h-10 items-center justify-center rounded-lg border px-3 py-2 text-xs font-medium ${
+              generatedReady
+                ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                : "border-amber-200 bg-amber-50 text-amber-700"
+            }`}
+          >
+            {generatedReady ? "已生成" : "系统生成"}
+          </span>
         ) : (
-          <div className="grid gap-2">
-            {findings.map((finding, index) => (
-              <div
-                key={`${finding.field}-${index}`}
-                className="rounded-lg border border-white/10 bg-white/6 px-3 py-3"
+          <div className="flex shrink-0 items-center gap-2 xl:self-start">
+            <label
+              className={`inline-flex min-h-10 cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-xs font-medium transition ${
+                uploading
+                  ? "border-slate-200 bg-slate-100 text-slate-500"
+                  : showComplete
+                    ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:border-emerald-300"
+                    : "border-slate-300 bg-white text-slate-700 hover:border-slate-400"
+              }`}
+            >
+              {uploading ? (
+                <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Upload className="h-3.5 w-3.5" />
+              )}
+              {uploading ? "上传中" : "上传文件"}
+              <input
+                type="file"
+                multiple
+                onChange={onUpload}
+                className="hidden"
+                accept={uploadAccept}
+                disabled={uploading}
+              />
+            </label>
+            {hasDocuments ? (
+              <button
+                type="button"
+                onClick={onClear}
+                className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-700 transition hover:border-slate-400"
               >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-semibold text-white">{finding.label}</span>
-                  <span className="truncate text-[11px] text-white/58">{finding.source}</span>
-                </div>
-                <p className="mt-1 text-sm text-emerald-200">{finding.value}</p>
-              </div>
-            ))}
+                <RefreshCcw className="h-3.5 w-3.5" />
+                清空
+              </button>
+            ) : null}
           </div>
         )}
       </div>
@@ -399,9 +507,9 @@ function AuthorizedPersonForm({
 }) {
   return (
     <div className="grid gap-4 rounded-xl border border-slate-200 bg-white px-4 py-4 lg:grid-cols-2">
-      <div className="lg:col-span-2 flex items-center justify-between">
+      <div className="flex items-center justify-between lg:col-span-2">
         <h3 className="text-sm font-semibold text-slate-900">授权人 {index + 1}</h3>
-        <span className="text-xs text-slate-500">对应原表第 5-6 页签名样本区</span>
+        <span className="text-xs text-slate-500">对应开户表授权及签名样本信息</span>
       </div>
       <Field label="全名">
         <input
@@ -431,7 +539,7 @@ function AuthorizedPersonForm({
           onChange={(event) => onChange({ idNumber: event.target.value })}
         />
       </Field>
-      <Field label="住宅地址" hint="会回填到授权人信息区的地址栏">
+      <Field label="住宅地址">
         <textarea
           className={textareaClassName}
           value={value.residentialAddress}
@@ -462,56 +570,214 @@ function AuthorizedPersonForm({
 
 export default function Home() {
   const signatureRef = useRef<SignatureCaptureHandle | null>(null);
+  const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [activeStep, setActiveStep] = useState<StepId>("upload");
-  const [formValues, setFormValues] = useState<CompanyAccountFormValues>(() => {
-    const initial = createInitialFormValues();
-    initial.intakeDate = todayString();
-    initial.declarationDate = todayString();
-    return initial;
-  });
+  const [formValues, setFormValues] = useState<CompanyAccountFormValues>(buildInitialFormValues);
   const [documents, setDocuments] = useState<UploadedDocument[]>([]);
   const [findings, setFindings] = useState<PrefillFinding[]>([]);
+  const [uploadingRequirement, setUploadingRequirement] =
+    useState<MaterialRequirementKey | null>(null);
   const [isExtracting, setIsExtracting] = useState(false);
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
-  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
-  const [pdfLabel, setPdfLabel] = useState("尚未生成 PDF");
-  const [statusMessage, setStatusMessage] = useState("等待上传资料");
+  const [isSavingDraft, setIsSavingDraft] = useState(false);
+  const [isSubmittingPackage, setIsSubmittingPackage] = useState(false);
+  const [reviewPdfUrl, setReviewPdfUrl] = useState<string | null>(null);
+  const [signedPdfUrl, setSignedPdfUrl] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState("等待上传支持文件");
   const [errorMessage, setErrorMessage] = useState("");
   const [signaturePreview, setSignaturePreview] = useState<string | null>(null);
+  const [submissionId, setSubmissionId] = useState<string | null>(null);
+  const [submissionRecord, setSubmissionRecord] = useState<SubmissionRecord | null>(null);
+  const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
+  const [backendState, setBackendState] = useState<
+    "checking" | "ready" | "missing" | "error"
+  >("checking");
+  const [backendDetail, setBackendDetail] = useState("正在检查 Supabase 后端状态");
+  const [backendConfigured, setBackendConfigured] = useState(false);
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  const backendReady = backendConfigured;
 
   useEffect(() => {
     return () => {
-      if (pdfUrl) {
-        URL.revokeObjectURL(pdfUrl);
+      if (reviewPdfUrl) {
+        URL.revokeObjectURL(reviewPdfUrl);
+      }
+      if (signedPdfUrl) {
+        URL.revokeObjectURL(signedPdfUrl);
+      }
+      if (autosaveTimerRef.current) {
+        clearTimeout(autosaveTimerRef.current);
       }
     };
-  }, [pdfUrl]);
+  }, [reviewPdfUrl, signedPdfUrl]);
+
+  const applySubmissionRecord = useCallback((submission: SubmissionRecord) => {
+    setSubmissionRecord(submission);
+    setSubmissionId(submission.id);
+    setLastSyncedAt(submission.updatedAt);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    fetchBackendStatus()
+      .then((payload) => {
+        if (cancelled) {
+          return;
+        }
+
+        if (payload.configured) {
+          setBackendConfigured(true);
+          setBackendState("ready");
+          setBackendDetail("Supabase 已接通，可保存文件、草稿与最终材料包。");
+          return;
+        }
+
+        setBackendConfigured(false);
+        setBackendState("missing");
+        setBackendDetail(
+          payload.missing?.length
+            ? `Supabase 尚未配置：${payload.missing.join("、")}`
+            : payload.message,
+        );
+      })
+      .catch((error) => {
+        if (cancelled) {
+          return;
+        }
+
+        setBackendConfigured(false);
+        setBackendState("error");
+        setBackendDetail(
+          error instanceof Error ? error.message : "无法确认 Supabase 后端状态。",
+        );
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const documentsByRequirement = useMemo(() => {
+    const map = new Map<MaterialRequirementKey, UploadedDocument[]>();
+
+    for (const document of documents) {
+      const key = document.requirementKey;
+      if (!key) {
+        continue;
+      }
+      const items = map.get(key) ?? [];
+      items.push(document);
+      map.set(key, items);
+    }
+
+    return map;
+  }, [documents]);
 
   const summary = useMemo(() => summarizeSelections(formValues), [formValues]);
   const missingItems = useMemo(() => getMissingItems(formValues), [formValues]);
+  const uploadedRequirementCount = useMemo(
+    () =>
+      initialUploadMaterialRequirements.filter(
+        (item) => (documentsByRequirement.get(item.key) ?? []).length > 0,
+      ).length,
+    [documentsByRequirement],
+  );
+  const coreUploadedCount = useMemo(
+    () =>
+      coreMaterialRequirementKeys.filter(
+        (key) => (documentsByRequirement.get(key) ?? []).length > 0,
+      ).length,
+    [documentsByRequirement],
+  );
+  const extractedFieldCount = useMemo(
+    () => new Set(findings.map((finding) => finding.field)).size,
+    [findings],
+  );
+  const reviewReady = Boolean(reviewPdfUrl || submissionRecord?.latestReviewPdfPath);
+  const signedReady = Boolean(
+    signedPdfUrl ||
+      submissionRecord?.latestSignedPdfPath ||
+      submissionRecord?.status === "signed" ||
+      submissionRecord?.status === "submitted",
+  );
+  const packageSubmitted = submissionRecord?.status === "submitted";
+
   const completedSteps = useMemo<StepId[]>(() => {
     const done: StepId[] = [];
     if (documents.length > 0) {
       done.push("upload");
-    }
-    if (!getStepValidationMessage("company", formValues)) {
       done.push("company");
     }
     if (!getStepValidationMessage("funding", formValues)) {
       done.push("funding");
     }
-    if (pdfUrl) {
+    if (signedReady) {
       done.push("review");
     }
-    if (signaturePreview) {
+    if (packageSubmitted) {
       done.push("sign");
     }
     return done;
-  }, [documents.length, formValues, pdfUrl, signaturePreview]);
+  }, [documents.length, formValues, packageSubmitted, signedReady]);
 
   const progress = Math.round(((stepIndex(activeStep) + 1) / steps.length) * 100);
   const currentStepCard = stepCards[activeStep];
   const CurrentStepIcon = currentStepCard.icon;
+
+  const persistDraft = useCallback(
+    async (status: SubmissionStatus = "draft", next?: {
+      formValues?: CompanyAccountFormValues;
+      findings?: PrefillFinding[];
+      documents?: UploadedDocument[];
+    }) => {
+      if (!backendReady) {
+        return null;
+      }
+
+      const payloadFormValues = next?.formValues ?? formValues;
+      const payloadFindings = next?.findings ?? findings;
+      const payloadDocuments = next?.documents ?? documents;
+
+      setIsSavingDraft(true);
+
+      try {
+        const { submission } = await saveDraftSubmission({
+          submissionId,
+          formValues: payloadFormValues,
+          findings: payloadFindings,
+          documents: payloadDocuments,
+          status,
+        });
+
+        applySubmissionRecord(submission);
+        setBackendState("ready");
+        setBackendDetail(
+          status === "submitted"
+            ? "完整材料包已同步到 Supabase。"
+            : status === "signed"
+              ? "签署版申请文件已同步到 Supabase。"
+              : status === "review_ready"
+                ? "复核版申请文件已同步到 Supabase。"
+                : "草稿已同步到 Supabase。",
+        );
+        setHasUnsavedChanges(false);
+
+        return submission;
+      } catch (error) {
+        setBackendState("error");
+        setBackendDetail(
+          error instanceof Error
+            ? `Supabase 同步失败：${error.message}`
+            : "Supabase 同步失败。",
+        );
+        return null;
+      } finally {
+        setIsSavingDraft(false);
+      }
+    },
+    [applySubmissionRecord, backendReady, documents, findings, formValues, submissionId],
+  );
 
   const updateField = <K extends keyof CompanyAccountFormValues>(
     key: K,
@@ -521,6 +787,7 @@ export default function Home() {
       ...current,
       [key]: value,
     }));
+    setHasUnsavedChanges(true);
   };
 
   const updateAuthorizedPerson = (
@@ -533,71 +800,169 @@ export default function Home() {
         personIndex === index ? { ...person, ...patch } : person,
       ),
     }));
+    setHasUnsavedChanges(true);
   };
 
-  const handleUpload = async (event: ChangeEvent<HTMLInputElement>) => {
-    const fileList = event.target.files;
+  const updateExperience = (
+    key: ExperienceKey,
+    patch: {
+      enabled?: boolean;
+      years?: string;
+    },
+  ) => {
+    setFormValues((current) => ({
+      ...current,
+      experiences: {
+        ...current.experiences,
+        [key]: {
+          ...current.experiences[key],
+          ...patch,
+        },
+      },
+    }));
+    setHasUnsavedChanges(true);
+  };
+
+  const handleRequirementUpload = async (
+    requirement: MaterialRequirement,
+    event: ChangeEvent<HTMLInputElement>,
+  ) => {
+    const input = event.target;
+    const fileList = input.files;
     if (!fileList?.length) {
       return;
     }
 
+    const selectedFiles = Array.from(fileList);
+    setUploadingRequirement(requirement.key);
     setIsExtracting(true);
     setErrorMessage("");
-    setStatusMessage("正在读取资料并匹配字段");
+    setStatusMessage(`正在接收 ${requirement.label}`);
 
     try {
       let nextValues = formValues;
       const nextDocuments: UploadedDocument[] = [];
       const nextFindings: PrefillFinding[] = [];
 
-      for (const file of Array.from(fileList)) {
-        const result = await extractDocumentData(file);
+      for (const file of selectedFiles) {
+        const result = await extractDocumentDataWithContext(file, {
+          kind: "supporting",
+          requirementKey: requirement.key,
+          requirementLabel: requirement.label,
+        });
         nextDocuments.push(result.document);
         nextFindings.push(...result.findings);
         nextValues = mergePatchIntoValues(nextValues, result.patch);
       }
 
-      setDocuments((current) => [...current, ...nextDocuments]);
-      setFindings((current) => [...current, ...nextFindings]);
+      const mergedDocuments = [
+        ...documents.filter((document) => document.requirementKey !== requirement.key),
+        ...nextDocuments,
+      ];
+      const mergedFindings = [
+        ...findings.filter((finding) => finding.requirementKey !== requirement.key),
+        ...nextFindings,
+      ];
+
+      setDocuments(mergedDocuments);
+      setFindings(mergedFindings);
       setFormValues(nextValues);
-      setStatusMessage(`已处理 ${nextDocuments.length} 份资料，等待人工补录剩余字段`);
+      setHasUnsavedChanges(true);
+
+      if (backendReady) {
+        setStatusMessage(`已接收 ${requirement.label}，正在写入 Supabase`);
+
+        const response = await uploadSubmissionDocuments({
+          files: selectedFiles,
+          documents: nextDocuments,
+          draft: {
+            submissionId,
+            formValues: nextValues,
+            findings: mergedFindings,
+            documents: mergedDocuments,
+            status: "draft",
+          },
+        });
+
+        setDocuments(response.documents);
+        applySubmissionRecord(response.submission);
+        setBackendState("ready");
+        setBackendDetail(`${requirement.label} 已存入 Supabase。`);
+        setHasUnsavedChanges(false);
+        setStatusMessage(`已更新 ${requirement.label}`);
+      } else {
+        setStatusMessage(`${requirement.label} 已更新，当前仅保存在本地页面`);
+      }
+
       setActiveStep("company");
     } catch (error) {
       setErrorMessage(
-        error instanceof Error ? error.message : "资料解析失败，请更换文件格式后重试。",
+        error instanceof Error ? error.message : "资料解析失败，请稍后重试。",
       );
-      setStatusMessage("资料解析失败");
+      setStatusMessage("资料处理失败");
+      if (backendReady) {
+        setBackendState("error");
+        setBackendDetail(
+          error instanceof Error
+            ? `文件入库失败：${error.message}`
+            : "文件入库失败。",
+        );
+      }
     } finally {
       setIsExtracting(false);
-      event.target.value = "";
+      setUploadingRequirement(null);
+      input.value = "";
     }
   };
 
-  const jumpToNextStep = () => {
-    const validation = getStepValidationMessage(activeStep, formValues);
-    if (validation) {
-      setErrorMessage(validation);
+  const clearRequirementDocuments = async (requirement: MaterialRequirement) => {
+    const nextDocuments = documents.filter(
+      (document) => document.requirementKey !== requirement.key,
+    );
+    const nextFindings = findings.filter(
+      (finding) => finding.requirementKey !== requirement.key,
+    );
+
+    setDocuments(nextDocuments);
+    setFindings(nextFindings);
+    setHasUnsavedChanges(true);
+    setStatusMessage(`已清空 ${requirement.label}`);
+    setErrorMessage("");
+
+    if (!backendReady) {
       return;
     }
 
-    setErrorMessage("");
-    const currentIndex = stepIndex(activeStep);
-    if (currentIndex < steps.length - 1) {
-      setActiveStep(steps[currentIndex + 1].id);
+    const submission = await persistDraft("draft", {
+      documents: nextDocuments,
+      findings: nextFindings,
+    });
+
+    if (submission) {
+      setBackendState("ready");
+      setBackendDetail(`${requirement.label} 的最新状态已同步到 Supabase。`);
     }
   };
 
   const generatePdf = async (mode: "review" | "final") => {
-    if (mode === "final" && signatureRef.current?.isEmpty()) {
-      setErrorMessage("请先完成电子签名，再导出签署版 PDF。");
-      setActiveStep("sign");
-      return;
+    if (mode === "final") {
+      const reviewValidation = getStepValidationMessage("review", formValues);
+      if (reviewValidation) {
+        setErrorMessage(reviewValidation);
+        setActiveStep("review");
+        return;
+      }
+
+      if (signatureRef.current?.isEmpty()) {
+        setErrorMessage("请先完成电子签名，再生成签署版 PDF。");
+        return;
+      }
     }
 
     if (mode === "review") {
       const firstIncompleteStep = getFirstIncompleteStep(formValues);
       if (firstIncompleteStep !== "review" && firstIncompleteStep !== "sign") {
-        setErrorMessage("基础资料还有缺项，请先补全后再生成复核版。");
+        setErrorMessage("仍有基础字段未补齐，请先完成检查补全。");
         setActiveStep(firstIncompleteStep);
         return;
       }
@@ -618,62 +983,290 @@ export default function Home() {
         values: formValues,
         signatureDataUrl,
       });
-      const nextUrl = URL.createObjectURL(blob);
+      const objectUrl = URL.createObjectURL(blob);
 
-      setPdfUrl((current) => {
-        if (current) {
-          URL.revokeObjectURL(current);
-        }
-        return nextUrl;
-      });
-
-      setPdfLabel(mode === "review" ? "复核版 PDF 已生成" : "签署版 PDF 已生成");
-      setStatusMessage(
-        mode === "review"
-          ? "客户可以开始逐页核对，不对的地方直接退回修改。"
-          : "签署版已生成，可下载或发送给客户归档。",
-      );
       if (mode === "review") {
-        setActiveStep("review");
+        setReviewPdfUrl((current) => {
+          if (current) {
+            URL.revokeObjectURL(current);
+          }
+          return objectUrl;
+        });
+      } else {
+        setSignedPdfUrl((current) => {
+          if (current) {
+            URL.revokeObjectURL(current);
+          }
+          return objectUrl;
+        });
+      }
+
+      if (backendReady) {
+        const draftSubmission =
+          (await persistDraft(deriveSubmissionStatus(mode))) ?? submissionRecord;
+
+        if (draftSubmission?.id) {
+          const uploadResult = await uploadSubmissionPdf({
+            submissionId: draftSubmission.id,
+            file: new File(
+              [blob],
+              mode === "review"
+                ? "company-account-review.pdf"
+                : "company-account-signed.pdf",
+              { type: "application/pdf" },
+            ),
+            mode,
+          });
+
+          applySubmissionRecord(uploadResult.submission);
+          setBackendState("ready");
+          setBackendDetail(
+            mode === "review"
+              ? "复核版申请文件已上传到 Supabase。"
+              : "签署版申请文件已上传到 Supabase。",
+          );
+        }
+      }
+
+      if (mode === "review") {
+        setStatusMessage("复核版已生成，可先检查，如无误再签字导出签署版。");
+      } else {
+        setStatusMessage("签署版已生成，下一步可确认完整材料包并发送后台。");
+        setActiveStep("sign");
       }
     } catch (error) {
       setErrorMessage(
         error instanceof Error ? error.message : "PDF 生成失败，请稍后重试。",
       );
       setStatusMessage("PDF 生成失败");
+      if (backendReady) {
+        setBackendState("error");
+        setBackendDetail(
+          error instanceof Error ? `PDF 入库失败：${error.message}` : "PDF 入库失败。",
+        );
+      }
     } finally {
       setIsGeneratingPdf(false);
     }
   };
 
+  const submitPackage = async () => {
+    if (!backendReady) {
+      setErrorMessage("当前后端未接通，无法提交最终材料包。");
+      return;
+    }
+
+    if (!signedReady) {
+      setErrorMessage("请先生成签署版 PDF，再发送完整材料包。");
+      setActiveStep("review");
+      return;
+    }
+
+    setIsSubmittingPackage(true);
+    setErrorMessage("");
+    setStatusMessage("正在提交完整材料包到后台");
+
+    try {
+      const submission = await persistDraft("submitted");
+      if (!submission) {
+        throw new Error("材料包提交失败。");
+      }
+
+      setBackendState("ready");
+      setBackendDetail("完整材料包已提交到 Supabase。");
+      setStatusMessage("完整材料包已发送到后台。");
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "材料包提交失败，请稍后重试。",
+      );
+      setStatusMessage("材料包提交失败");
+    } finally {
+      setIsSubmittingPackage(false);
+    }
+  };
+
+  useEffect(() => {
+    if (
+      !backendReady ||
+      !hasUnsavedChanges ||
+      isExtracting ||
+      isGeneratingPdf ||
+      isSubmittingPackage
+    ) {
+      return;
+    }
+
+    if (autosaveTimerRef.current) {
+      clearTimeout(autosaveTimerRef.current);
+    }
+
+    autosaveTimerRef.current = setTimeout(() => {
+      void persistDraft("draft");
+    }, autosaveDelayMs);
+
+    return () => {
+      if (autosaveTimerRef.current) {
+        clearTimeout(autosaveTimerRef.current);
+      }
+    };
+  }, [
+    backendReady,
+    hasUnsavedChanges,
+    isExtracting,
+    isGeneratingPdf,
+    isSubmittingPackage,
+    persistDraft,
+  ]);
+
+  const helperText = useMemo(() => {
+    if (activeStep === "upload") {
+      return documents.length > 0
+        ? `已上传 ${documents.length} 份支持文件，覆盖 ${uploadedRequirementCount} 个材料项。`
+        : "请先按清单上传支持文件。";
+    }
+
+    if (activeStep === "company") {
+      return findings.length > 0
+        ? `已自动命中 ${extractedFieldCount} 个预填字段。`
+        : "尚未命中预填字段，仍可直接进入人工填写。";
+    }
+
+    if (activeStep === "funding") {
+      return (
+        getStepValidationMessage("funding", formValues) ||
+        "基础字段已补齐，可以进入文件生成与签署。"
+      );
+    }
+
+    if (activeStep === "review") {
+      if (signedReady) {
+        return "签署版申请文件已生成，可以进入最终确认发送。";
+      }
+      if (reviewReady) {
+        return "复核版已生成，确认无误后请签字并导出签署版。";
+      }
+      return "请先生成复核版，再完成电子签名与签署版导出。";
+    }
+
+    return packageSubmitted ? "材料包已发送后台。" : "确认最终材料包后发送后台。";
+  }, [
+    activeStep,
+    documents.length,
+    extractedFieldCount,
+    findings.length,
+    formValues,
+    packageSubmitted,
+    reviewReady,
+    signedReady,
+    uploadedRequirementCount,
+  ]);
+
+  const jumpToNextStep = () => {
+    if (activeStep === "upload") {
+      if (documents.length === 0) {
+        setErrorMessage("请先上传至少一项支持文件。");
+        return;
+      }
+      setErrorMessage("");
+      setActiveStep("company");
+      return;
+    }
+
+    if (activeStep === "company") {
+      setErrorMessage("");
+      setActiveStep("funding");
+      return;
+    }
+
+    if (activeStep === "funding") {
+      const validation = getStepValidationMessage("funding", formValues);
+      if (validation) {
+        setErrorMessage(validation);
+        return;
+      }
+      setErrorMessage("");
+      setActiveStep("review");
+      return;
+    }
+
+    if (activeStep === "review") {
+      if (!signedReady) {
+        setErrorMessage("请先生成签署版 PDF，再进入最终确认发送。");
+        return;
+      }
+      setErrorMessage("");
+      setActiveStep("sign");
+    }
+  };
+
+  const leftRequirements = materialRequirements.filter((item) => item.side === "left");
+  const rightRequirements = materialRequirements.filter((item) => item.side === "right");
+  const uploadRows = Array.from(
+    { length: Math.max(leftRequirements.length, rightRequirements.length) },
+    (_, index) => ({
+      left: leftRequirements[index] ?? null,
+      right: rightRequirements[index] ?? null,
+    }),
+  );
+  const findingsByRequirement = useMemo(() => {
+    const map = new Map<string, PrefillFinding[]>();
+
+    for (const finding of findings) {
+      const key = finding.requirementLabel ?? finding.source;
+      const items = map.get(key) ?? [];
+      items.push(finding);
+      map.set(key, items);
+    }
+
+    return Array.from(map.entries());
+  }, [findings]);
+
+  const metricCards = [
+    {
+      label: "支持文件",
+      value: `${uploadedRequirementCount}/${initialUploadMaterialRequirements.length}`,
+      accent: "from-amber-500/35 to-orange-500/10",
+    },
+    {
+      label: "自动预填字段",
+      value: String(extractedFieldCount),
+      accent: "from-emerald-500/35 to-teal-500/10",
+    },
+    {
+      label: "最终材料包",
+      value: signedReady ? "已生成" : "待生成",
+      accent: "from-sky-500/35 to-cyan-500/10",
+    },
+  ];
+
   return (
-    <div className="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(245,158,11,0.16),_transparent_26%),radial-gradient(circle_at_top_right,_rgba(16,185,129,0.14),_transparent_24%),linear-gradient(180deg,_#f7f6f2_0%,_#eef3f7_52%,_#f4f7fb_100%)] text-slate-900">
-      <main className="mx-auto flex w-full max-w-[1520px] flex-col gap-8 px-4 py-4 sm:px-6 lg:px-8 lg:py-6">
+    <div className="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(245,158,11,0.16),_transparent_24%),radial-gradient(circle_at_top_right,_rgba(16,185,129,0.12),_transparent_24%),linear-gradient(180deg,_#f7f6f2_0%,_#eef3f7_52%,_#f4f7fb_100%)] text-slate-900">
+      <main className="mx-auto flex w-full max-w-[1540px] flex-col gap-8 px-4 py-4 sm:px-6 lg:px-8 lg:py-6">
         <section className={`${panelClassName} overflow-hidden`}>
-          <div className="grid gap-6 px-5 py-5 sm:px-6 lg:grid-cols-[1.2fr_0.8fr] lg:px-8 lg:py-7">
+          <div className="grid gap-6 px-5 py-5 sm:px-6 lg:grid-cols-[1.15fr_0.85fr] lg:px-8 lg:py-7">
             <div className="flex flex-col gap-6">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="inline-flex items-center gap-2 rounded-full bg-slate-950 px-3 py-1.5 text-xs font-semibold text-white">
                   <ClipboardCheck className="h-3.5 w-3.5" />
-                  Corporate account onboarding
+                  Company account onboarding
                 </span>
                 <span className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1.5 text-xs font-medium text-slate-600 ring-1 ring-slate-200">
                   <Sparkles className="h-3.5 w-3.5 text-amber-500" />
-                  与原始空白 PDF 同模板输出
+                  支持文件上传、预填、签署与后台归档
                 </span>
               </div>
 
               <div className="flex flex-col gap-3">
                 <h1 className="max-w-4xl text-3xl font-semibold tracking-tight text-slate-950 sm:text-4xl lg:text-[2.75rem]">
-                  把公司开户表做成一条完整的电子化录入与签署流程
+                  把公司开户材料整理成一条完整的电子化提交链路
                 </h1>
                 <p className="max-w-3xl text-sm leading-7 text-slate-600 sm:text-[15px]">
-                  这版工作台直接围绕你提供的空白开户表搭建。客户先上传资料，系统先做可摘取字段的预填；人工补齐后，输出一份与原始表格一致的 PDF 草稿供复核；确认无误，再回到签署页完成电子签名并导出最终版本。
+                  客户先上传所有支持文件，系统对可读取资料做自动摘取并预填写；客户再检查和补全开户表；随后生成与原始 PDF 一致的申请文件供检查、签字；最后把签署版申请文件和全部支持文件一起发送到后台。
                 </p>
               </div>
 
               <div className="grid gap-3 sm:grid-cols-3">
-                {metrics.map((metric) => (
+                {metricCards.map((metric) => (
                   <div
                     key={metric.label}
                     className={`rounded-xl border border-white/65 bg-gradient-to-br ${metric.accent} p-[1px]`}
@@ -731,9 +1324,41 @@ export default function Home() {
                   )}
                   {errorMessage || statusMessage}
                 </div>
-                <p className="mt-3 text-xs leading-5 text-slate-500">
-                  复核版生成后，客户可以直接指出哪一段要重写，再回到对应步骤修改并重新导出。
-                </p>
+                <p className="mt-3 text-xs leading-5 text-slate-500">{helperText}</p>
+              </div>
+
+              <div className="rounded-xl border border-slate-200 bg-white px-5 py-4">
+                <div className="flex items-center gap-2">
+                  <Database
+                    className={`h-4 w-4 ${
+                      backendState === "ready"
+                        ? "text-emerald-600"
+                        : backendState === "checking"
+                          ? "text-amber-500"
+                          : "text-rose-500"
+                    }`}
+                  />
+                  <p className="text-xs font-semibold uppercase tracking-[0.12em] text-slate-500">
+                    Supabase 同步
+                  </p>
+                </div>
+                <div className="mt-3 space-y-2">
+                  <p className="text-sm font-medium text-slate-900">{backendDetail}</p>
+                  <div className="grid gap-1 text-xs text-slate-500">
+                    <span>当前提交：{submissionId ? submissionId.slice(0, 8) : "尚未创建"}</span>
+                    <span>
+                      最近同步：{lastSyncedAt ? formatSyncTime(lastSyncedAt) : "尚未同步"}
+                    </span>
+                    <span>
+                      草稿状态：
+                      {isSavingDraft
+                        ? "同步中"
+                        : hasUnsavedChanges
+                          ? "有未同步改动"
+                          : submissionRecord?.status ?? "未开始"}
+                    </span>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -751,7 +1376,7 @@ export default function Home() {
 
             <div className={`${panelClassName} p-4`}>
               <div className="mb-3 flex items-center justify-between">
-                <h3 className="text-sm font-semibold text-slate-900">表单速览</h3>
+                <h3 className="text-sm font-semibold text-slate-900">提交概览</h3>
                 <span className="text-xs text-slate-500">
                   {countCompletedExperiences(formValues)} 项经验已填写
                 </span>
@@ -770,6 +1395,17 @@ export default function Home() {
                 </div>
                 <div className="rounded-xl bg-slate-50 px-3 py-3">
                   <p className="text-xs font-medium uppercase tracking-[0.12em] text-slate-500">
+                    上传完成
+                  </p>
+                  <p className="mt-2 leading-6 text-slate-700">
+                    核心材料 {coreUploadedCount}/{coreMaterialRequirementKeys.length}
+                  </p>
+                  <p className="mt-1 text-xs text-slate-500">
+                    总计 {uploadedRequirementCount}/{initialUploadMaterialRequirements.length}
+                  </p>
+                </div>
+                <div className="rounded-xl bg-slate-50 px-3 py-3">
+                  <p className="text-xs font-medium uppercase tracking-[0.12em] text-slate-500">
                     账户类型
                   </p>
                   <p className="mt-2 leading-6 text-slate-700">
@@ -778,21 +1414,10 @@ export default function Home() {
                 </div>
                 <div className="rounded-xl bg-slate-50 px-3 py-3">
                   <p className="text-xs font-medium uppercase tracking-[0.12em] text-slate-500">
-                    资金来源
+                    最终申请文件
                   </p>
                   <p className="mt-2 leading-6 text-slate-700">
-                    {summary.initialFunding || "尚未填写初始来源"}
-                  </p>
-                  <p className="mt-1 text-xs leading-5 text-slate-500">
-                    持续来源：{summary.ongoingFunding || "尚未填写"}
-                  </p>
-                </div>
-                <div className="rounded-xl bg-slate-50 px-3 py-3">
-                  <p className="text-xs font-medium uppercase tracking-[0.12em] text-slate-500">
-                    签署状态
-                  </p>
-                  <p className="mt-2 leading-6 text-slate-700">
-                    {signaturePreview ? "已捕捉电子签名" : "尚未签署"}
+                    {signedReady ? "签署版已生成" : reviewReady ? "复核版已生成" : "尚未生成"}
                   </p>
                 </div>
               </div>
@@ -804,74 +1429,82 @@ export default function Home() {
               <section className={`${panelClassName} px-5 py-5 sm:px-6 lg:px-8 lg:py-7`}>
                 <SectionHeading
                   eyebrow="Step 1"
-                  title="上传原始资料并做首轮自动预填"
-                  body="当前版本优先支持 PDF、TXT、CSV、Markdown 和 JSON。对于已有结构化客户清单，JSON 或 CSV 命中率最高；对于商业登记证、注册文件等文字 PDF，也能直接抽取公司名称、地址、编号、电邮与电话。"
+                  title="先按材料清单上传所有支持文件"
+                  body="这一阶段只上传支持文件，不上传最终开户申请表。开户申请表会在客户检查、补全并签字后由系统生成，并自动并入最终材料包。"
                 />
 
-                <div className="mt-6 grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
-                  <div className="rounded-2xl border border-dashed border-slate-300 bg-[linear-gradient(135deg,rgba(255,255,255,0.88),rgba(246,248,251,0.92))] px-5 py-6">
-                    <div className="flex flex-col gap-4">
-                      <div className="inline-flex h-12 w-12 items-center justify-center rounded-xl bg-amber-100 text-amber-700">
-                        <Upload className="h-5 w-5" />
-                      </div>
+                <div className="mt-6 grid gap-4">
+                  <div className="rounded-2xl border border-slate-200 bg-[linear-gradient(135deg,rgba(255,255,255,0.92),rgba(245,247,250,0.96))] px-5 py-5">
+                    <div className="flex items-start gap-4">
+                      <span className="inline-flex h-12 w-12 items-center justify-center rounded-xl bg-emerald-100 text-emerald-700">
+                        <Building2 className="h-5 w-5" />
+                      </span>
                       <div>
-                        <h3 className="text-lg font-semibold text-slate-950">
-                          上传客户资料包
-                        </h3>
-                        <p className="mt-2 max-w-xl text-sm leading-7 text-slate-600">
-                          建议优先上传商业登记证、公司注册证书、客户主数据清单和联系资料。系统会把命中的字段列到右侧，人工确认后再进入下一步。
+                        <h3 className="text-lg font-semibold text-slate-950">材料上传规则</h3>
+                        <p className="mt-2 text-sm leading-7 text-slate-600">
+                          支持文件按清单逐项上传即可。桌面端按左右两栏横向排列，尽量贴近原始材料清单；手机端会自动折成上下结构。文字型 PDF、TXT、CSV、JSON 会优先参与自动摘取，图片类资料当前版本先做原件保存和归档展示。
                         </p>
-                      </div>
-                      <div className="flex flex-wrap items-center gap-3">
-                        <label className="inline-flex cursor-pointer items-center gap-2 rounded-full bg-slate-950 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-slate-800">
-                          <Upload className="h-4 w-4" />
-                          选择资料
-                          <input
-                            type="file"
-                            multiple
-                            onChange={handleUpload}
-                            className="hidden"
-                            accept=".pdf,.txt,.csv,.md,.markdown,.json"
-                          />
-                        </label>
-                        {isExtracting ? (
-                          <span className="inline-flex items-center gap-2 text-sm text-slate-500">
-                            <LoaderCircle className="h-4 w-4 animate-spin" />
-                            正在解析
-                          </span>
-                        ) : null}
                       </div>
                     </div>
                   </div>
 
-                  <div className="grid gap-3">
-                    {previewDeck.slice(0, 2).map((preview) => (
-                      <div
-                        key={preview.src}
-                        className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm"
-                      >
-                        <div className="relative aspect-[1.16] w-full bg-slate-100">
-                          <Image
-                            src={preview.src}
-                            alt={preview.title}
-                            fill
-                            className="object-cover object-top"
-                            sizes="(max-width: 1024px) 100vw, 28vw"
-                          />
-                        </div>
-                        <div className="px-4 py-4">
-                          <h3 className="text-sm font-semibold text-slate-900">{preview.title}</h3>
-                          <p className="mt-1 text-xs leading-5 text-slate-500">
-                            {preview.subtitle}
-                          </p>
-                        </div>
+                  <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
+                    <div className="hidden bg-slate-50 lg:grid lg:grid-cols-2">
+                      <div className="border-r border-slate-200 px-5 py-3 text-sm font-semibold text-slate-700">
+                        材料清单 A
                       </div>
-                    ))}
-                  </div>
-                </div>
+                      <div className="px-5 py-3 text-sm font-semibold text-slate-700">
+                        材料清单 B
+                      </div>
+                    </div>
 
-                <div className="mt-6">
-                  <DocumentList documents={documents} findings={findings} />
+                    <div className="grid">
+                      {uploadRows.map((row, index) => (
+                        <div
+                          key={`upload-row-${index}`}
+                          className="grid border-t border-slate-200 first:border-t-0 lg:grid-cols-2"
+                        >
+                          <div className="border-slate-200 lg:border-r">
+                            {row.left ? (
+                              <MaterialRequirementCell
+                                requirement={row.left}
+                                documents={documentsByRequirement.get(row.left.key) ?? []}
+                                generatedReady={signedReady}
+                                uploading={uploadingRequirement === row.left.key}
+                                onUpload={(event) => {
+                                  void handleRequirementUpload(row.left, event);
+                                }}
+                                onClear={() => {
+                                  void clearRequirementDocuments(row.left);
+                                }}
+                              />
+                            ) : (
+                              <div className="h-full px-4 py-4" />
+                            )}
+                          </div>
+
+                          <div className="border-t border-slate-200 lg:border-t-0">
+                            {row.right ? (
+                              <MaterialRequirementCell
+                                requirement={row.right}
+                                documents={documentsByRequirement.get(row.right.key) ?? []}
+                                generatedReady={signedReady}
+                                uploading={uploadingRequirement === row.right.key}
+                                onUpload={(event) => {
+                                  void handleRequirementUpload(row.right, event);
+                                }}
+                                onClear={() => {
+                                  void clearRequirementDocuments(row.right);
+                                }}
+                              />
+                            ) : (
+                              <div className="h-full px-4 py-4" />
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
                 </div>
               </section>
             ) : null}
@@ -880,11 +1513,189 @@ export default function Home() {
               <section className={`${panelClassName} px-5 py-5 sm:px-6 lg:px-8 lg:py-7`}>
                 <SectionHeading
                   eyebrow="Step 2"
-                  title="公司资料、账户类型与联络方式"
-                  body="这一段优先对应原表第 1-2 页的基础信息区。可先接受自动预填，再人工补齐开户编号、公司名称、地址、注册编号、联系渠道与账户类型。"
+                  title="整理自动摘取和预填写结果"
+                  body="系统会把上传资料里可读取的信息先整理出来。这里重点看两件事：一是有哪些字段已经可以直接预填；二是哪些资料虽然已上传，但仍需人工录入。"
                 />
 
-                <div className="mt-6 grid gap-6">
+                <div className="mt-6 grid gap-6 xl:grid-cols-[0.95fr_1.05fr]">
+                  <div className="grid gap-4">
+                    <div className="grid gap-4 md:grid-cols-3">
+                      <div className="rounded-2xl border border-slate-200 bg-white px-4 py-4">
+                        <p className="text-xs font-medium uppercase tracking-[0.12em] text-slate-500">
+                          已收文件
+                        </p>
+                        <p className="mt-2 text-2xl font-semibold text-slate-950">
+                          {documents.length}
+                        </p>
+                        <p className="mt-1 text-xs text-slate-500">
+                          覆盖 {uploadedRequirementCount} 个材料项
+                        </p>
+                      </div>
+                      <div className="rounded-2xl border border-slate-200 bg-white px-4 py-4">
+                        <p className="text-xs font-medium uppercase tracking-[0.12em] text-slate-500">
+                          可预填字段
+                        </p>
+                        <p className="mt-2 text-2xl font-semibold text-slate-950">
+                          {extractedFieldCount}
+                        </p>
+                        <p className="mt-1 text-xs text-slate-500">
+                          来源于 {findingsByRequirement.length} 类资料
+                        </p>
+                      </div>
+                      <div className="rounded-2xl border border-slate-200 bg-white px-4 py-4">
+                        <p className="text-xs font-medium uppercase tracking-[0.12em] text-slate-500">
+                          人工补录
+                        </p>
+                        <p className="mt-2 text-2xl font-semibold text-slate-950">
+                          {missingItems.length}
+                        </p>
+                        <p className="mt-1 text-xs text-slate-500">后续在检查补全步骤完成</p>
+                      </div>
+                    </div>
+
+                    <div className="rounded-2xl border border-slate-200 bg-slate-950 px-5 py-5 text-white">
+                      <div className="mb-4 flex items-center gap-2">
+                        <Sparkles className="h-4 w-4 text-amber-300" />
+                        <h3 className="text-sm font-semibold">自动命中字段</h3>
+                      </div>
+                      {findingsByRequirement.length === 0 ? (
+                        <p className="text-sm leading-6 text-white/68">
+                          当前还没有自动命中字段。图片类证照会先保存原件；如需更高命中率，优先上传文字型 PDF、CSV 或结构化 JSON。
+                        </p>
+                      ) : (
+                        <div className="grid gap-3">
+                          {findingsByRequirement.map(([group, groupFindings]) => (
+                            <div
+                              key={group}
+                              className="rounded-xl border border-white/10 bg-white/6 px-4 py-4"
+                            >
+                              <div className="flex items-center justify-between gap-3">
+                                <h3 className="text-sm font-semibold text-white">{group}</h3>
+                                <span className="text-xs text-white/55">
+                                  {groupFindings.length} 项命中
+                                </span>
+                              </div>
+                              <div className="mt-3 grid gap-2">
+                                {groupFindings.map((finding, index) => (
+                                  <div
+                                    key={`${finding.field}-${group}-${index}`}
+                                    className="rounded-lg border border-white/8 bg-white/5 px-3 py-3"
+                                  >
+                                    <div className="flex items-center justify-between gap-2">
+                                      <span className="text-xs font-semibold text-white">
+                                        {finding.label}
+                                      </span>
+                                      <span className="truncate text-[11px] text-white/55">
+                                        {finding.source}
+                                      </span>
+                                    </div>
+                                    <p className="mt-1 text-sm text-emerald-200">
+                                      {finding.value}
+                                    </p>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="grid gap-4">
+                    <div className="rounded-2xl border border-slate-200 bg-white px-5 py-5">
+                      <div className="mb-4 flex items-center justify-between">
+                        <div>
+                          <h3 className="text-sm font-semibold text-slate-900">
+                            资料解析状态
+                          </h3>
+                          <p className="mt-1 text-xs text-slate-500">
+                            每份资料都会显示是否参与预填写，以及当前解析说明。
+                          </p>
+                        </div>
+                      </div>
+                      <div className="grid gap-3">
+                        {documents.length === 0 ? (
+                          <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-sm text-slate-500">
+                            还没有上传资料。
+                          </div>
+                        ) : (
+                          documents.map((document) => (
+                            <div
+                              key={document.id}
+                              className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-4"
+                            >
+                              <div className="flex items-start justify-between gap-3">
+                                <div className="min-w-0">
+                                  <p className="truncate text-sm font-semibold text-slate-900">
+                                    {document.requirementLabel || document.name}
+                                  </p>
+                                  <p className="mt-1 truncate text-xs text-slate-500">
+                                    {document.name}
+                                  </p>
+                                </div>
+                                <span
+                                  className={`inline-flex rounded-full px-2.5 py-1 text-[11px] font-medium ${
+                                    document.extractable
+                                      ? "bg-emerald-50 text-emerald-700"
+                                      : "bg-slate-200 text-slate-600"
+                                  }`}
+                                >
+                                  {document.extractable ? "已预填" : "仅归档"}
+                                </span>
+                              </div>
+                              <p className="mt-2 text-xs leading-5 text-slate-500">
+                                {document.parseNote}
+                              </p>
+                              {document.extractedTextSample ? (
+                                <p className="mt-2 rounded-lg bg-white px-3 py-2 text-xs leading-5 text-slate-600">
+                                  {document.extractedTextSample}
+                                </p>
+                              ) : null}
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+                      <div className="relative aspect-[1.24] w-full bg-slate-100">
+                        <Image
+                          src={previewDeck[0]?.src ?? "/companyAccount-cover.png"}
+                          alt={previewDeck[0]?.title ?? "开户表预览"}
+                          fill
+                          className="object-cover object-top"
+                          sizes="(max-width: 1024px) 100vw, 28vw"
+                        />
+                      </div>
+                      <div className="px-4 py-4">
+                        <h3 className="text-sm font-semibold text-slate-900">
+                          最终生成文件仍沿用原始 PDF 模板
+                        </h3>
+                        <p className="mt-1 text-xs leading-5 text-slate-500">
+                          上传步骤解决“先收资料”，检查补全步骤解决“把内容填对”，生成步骤再解决“输出与签字”。
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </section>
+            ) : null}
+
+            {activeStep === "funding" ? (
+              <section className={`${panelClassName} px-5 py-5 sm:px-6 lg:px-8 lg:py-7`}>
+                <SectionHeading
+                  eyebrow="Step 3"
+                  title="检查自动预填结果，并补全开户信息"
+                  body="这里把公司资料、账户类型、通讯方式、资金来源、资本结构、授权人和风险经验一次补齐。系统命中的字段已经先带入，你只需要核对和修正。"
+                />
+
+                <div className="mt-6 grid gap-8">
+                  <div className="rounded-2xl border border-emerald-200 bg-emerald-50/80 px-5 py-4 text-sm leading-7 text-emerald-800">
+                    已从上传资料中命中 <span className="font-semibold">{extractedFieldCount}</span>{" "}
+                    个字段。建议先检查公司名称、地址、注册编号、联络方式和资金来源，再继续生成申请文件。
+                  </div>
+
                   <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                     <Field label="开户号码">
                       <input
@@ -922,7 +1733,7 @@ export default function Home() {
                   </div>
 
                   <div className="grid gap-4 xl:grid-cols-2">
-                    <Field label="注册地址" hint="成立国家之注册地址">
+                    <Field label="注册地址">
                       <textarea
                         className={textareaClassName}
                         value={formValues.registeredAddress}
@@ -931,7 +1742,7 @@ export default function Home() {
                         }
                       />
                     </Field>
-                    <Field label="营业地址" hint="如与注册地址相同，可直接复制">
+                    <Field label="营业地址">
                       <textarea
                         className={textareaClassName}
                         value={formValues.businessAddress}
@@ -1021,11 +1832,11 @@ export default function Home() {
                     />
                   </Field>
 
-                  <div className="grid gap-6 xl:grid-cols-[1.1fr_0.9fr]">
+                  <div className="grid gap-6 xl:grid-cols-[1.05fr_0.95fr]">
                     <div className="grid gap-3">
                       <div className="flex items-center justify-between">
                         <h3 className="text-sm font-semibold text-slate-900">账户类型</h3>
-                        <span className="text-xs text-slate-500">对应原表第 2 页 Account Type</span>
+                        <span className="text-xs text-slate-500">对应开户表 Account Type</span>
                       </div>
                       <div className="grid gap-3 sm:grid-cols-2">
                         {accountTypeOptions.map((option) => (
@@ -1117,19 +1928,7 @@ export default function Home() {
                       </div>
                     </div>
                   </div>
-                </div>
-              </section>
-            ) : null}
 
-            {activeStep === "funding" ? (
-              <section className={`${panelClassName} px-5 py-5 sm:px-6 lg:px-8 lg:py-7`}>
-                <SectionHeading
-                  eyebrow="Step 3"
-                  title="资金来源、资本结构、授权人和风险经验"
-                  body="这一段对应原表第 5-6 页，是整份开户表里字段最多也最容易漏项的部分。界面已经按原始 PDF 顺序拆开，便于客户逐段填写。"
-                />
-
-                <div className="mt-6 grid gap-8">
                   <div className="grid gap-6 xl:grid-cols-2">
                     <div className="grid gap-4">
                       <div className="grid gap-3">
@@ -1167,9 +1966,7 @@ export default function Home() {
                               key={option.key}
                               label={option.label}
                               active={formValues.sourceRegion === option.key}
-                              onClick={() =>
-                                updateField("sourceRegion", option.key)
-                              }
+                              onClick={() => updateField("sourceRegion", option.key)}
                             />
                           ))}
                         </div>
@@ -1188,7 +1985,7 @@ export default function Home() {
                     </div>
 
                     <div className="grid gap-4 rounded-2xl bg-slate-950 px-5 py-5 text-white">
-                      <h3 className="text-sm font-semibold">资本结构与最近财务资料</h3>
+                      <h3 className="text-sm font-semibold">资本结构与财务资料</h3>
                       <div className="grid gap-4 md:grid-cols-2">
                         <Field label="法定资本（HK$）">
                           <input
@@ -1284,7 +2081,7 @@ export default function Home() {
                     <div className="grid gap-4">
                       <div className="flex items-center justify-between">
                         <h3 className="text-sm font-semibold text-slate-900">初始资金来源</h3>
-                        <span className="text-xs text-slate-500">对应原表第 5 页第一组勾选</span>
+                        <span className="text-xs text-slate-500">对应表内初始来源勾选</span>
                       </div>
                       <div className="grid gap-3 sm:grid-cols-2">
                         {fundingSourceOptions.map((option) => (
@@ -1320,7 +2117,7 @@ export default function Home() {
                     <div className="grid gap-4">
                       <div className="flex items-center justify-between">
                         <h3 className="text-sm font-semibold text-slate-900">持续资金来源</h3>
-                        <span className="text-xs text-slate-500">对应原表第 5 页第二组勾选</span>
+                        <span className="text-xs text-slate-500">对应表内持续来源勾选</span>
                       </div>
                       <div className="grid gap-3 sm:grid-cols-2">
                         {fundingSourceOptions.map((option) => (
@@ -1369,7 +2166,7 @@ export default function Home() {
                     <div className="grid gap-4">
                       <div className="flex items-center justify-between">
                         <h3 className="text-sm font-semibold text-slate-900">投资目标</h3>
-                        <span className="text-xs text-slate-500">对应原表第 6 页顶部勾选</span>
+                        <span className="text-xs text-slate-500">对应风险偏好与目的</span>
                       </div>
                       <div className="grid gap-3 sm:grid-cols-2">
                         {investmentObjectiveOptions.map((option) => (
@@ -1401,7 +2198,7 @@ export default function Home() {
                       <div className="grid gap-3 rounded-xl border border-slate-200 bg-slate-50 px-4 py-4">
                         <div className="flex items-center justify-between">
                           <h3 className="text-sm font-semibold text-slate-900">衍生产品认知</h3>
-                          <span className="text-xs text-slate-500">对应第 6 页风险声明区</span>
+                          <span className="text-xs text-slate-500">风险声明区</span>
                         </div>
                         <div className="grid gap-3">
                           {derivativeKnowledgeOptions.map((option) => (
@@ -1454,18 +2251,7 @@ export default function Home() {
                                 <div className="bg-white px-3 py-3">
                                   <button
                                     type="button"
-                                    onClick={() =>
-                                      setFormValues((current) => ({
-                                        ...current,
-                                        experiences: {
-                                          ...current.experiences,
-                                          [row.key]: {
-                                            enabled: false,
-                                            years: "",
-                                          },
-                                        },
-                                      }))
-                                    }
+                                    onClick={() => updateExperience(row.key, { enabled: false, years: "" })}
                                     className={sectionButtonClass(!entry.enabled)}
                                   >
                                     无
@@ -1475,18 +2261,7 @@ export default function Home() {
                                   <div className="flex items-center gap-2">
                                     <button
                                       type="button"
-                                      onClick={() =>
-                                        setFormValues((current) => ({
-                                          ...current,
-                                          experiences: {
-                                            ...current.experiences,
-                                            [row.key]: {
-                                              ...current.experiences[row.key],
-                                              enabled: true,
-                                            },
-                                          },
-                                        }))
-                                      }
+                                      onClick={() => updateExperience(row.key, { enabled: true })}
                                       className={sectionButtonClass(entry.enabled)}
                                     >
                                       有
@@ -1495,16 +2270,10 @@ export default function Home() {
                                       className="min-h-10 w-20 rounded-lg border border-slate-300 px-3 text-sm outline-none transition focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/15"
                                       value={entry.years}
                                       onChange={(event) =>
-                                        setFormValues((current) => ({
-                                          ...current,
-                                          experiences: {
-                                            ...current.experiences,
-                                            [row.key]: {
-                                              enabled: true,
-                                              years: event.target.value,
-                                            },
-                                          },
-                                        }))
+                                        updateExperience(row.key, {
+                                          enabled: true,
+                                          years: event.target.value,
+                                        })
                                       }
                                       placeholder="年数"
                                     />
@@ -1525,52 +2294,58 @@ export default function Home() {
               <section className={`${panelClassName} px-5 py-5 sm:px-6 lg:px-8 lg:py-7`}>
                 <SectionHeading
                   eyebrow="Step 4"
-                  title="先出复核版，再决定回退哪里修改"
-                  body="这里先做客户核对用的 PDF 草稿。若发现信息不对，可以直接记录修订说明，并一键回到对应步骤重新填写。"
+                  title="生成申请文件、检查、签字并导出签署版"
+                  body="先生成复核版 PDF 供客户检查；发现问题时可直接返回上一步修改。确认无误后，在这里完成电子签名并导出签署版 PDF。"
                 />
 
-                <div className="mt-6 grid gap-6 xl:grid-cols-[0.92fr_1.08fr]">
+                <div className="mt-6 grid gap-6 xl:grid-cols-[0.96fr_1.04fr]">
                   <div className="grid gap-4">
                     <div className="rounded-2xl border border-slate-200 bg-white px-5 py-5">
                       <div className="flex items-center justify-between gap-3">
                         <div>
                           <h3 className="text-sm font-semibold text-slate-900">缺项检查</h3>
                           <p className="mt-1 text-xs text-slate-500">
-                            先看还有没有会影响生成 PDF 的必填项。
+                            先确认是否还有会影响生成申请文件的字段缺失。
                           </p>
                         </div>
                         <span
                           className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${
-                            missingItems.length === 0
+                            missingItems.filter((item) => item.step === "funding").length === 0
                               ? "bg-emerald-50 text-emerald-700"
                               : "bg-amber-50 text-amber-700"
                           }`}
                         >
-                          {missingItems.length === 0 ? "可生成" : `${missingItems.length} 项待补`}
+                          {missingItems.filter((item) => item.step === "funding").length === 0
+                            ? "可生成"
+                            : `${missingItems.filter((item) => item.step === "funding").length} 项待补`}
                         </span>
                       </div>
                       <div className="mt-4 grid gap-2">
-                        {missingItems.length === 0 ? (
+                        {missingItems.filter((item) => item.step === "funding").length === 0 ? (
                           <div className="rounded-xl bg-emerald-50 px-4 py-4 text-sm text-emerald-700">
-                            当前必填项已齐，可以生成复核版 PDF。
+                            基础字段已齐，可以生成复核版 PDF。
                           </div>
                         ) : (
-                          missingItems.map((item) => (
-                            <button
-                              key={`${item.step}-${item.label}`}
-                              type="button"
-                              onClick={() => setActiveStep(item.step)}
-                              className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-left transition hover:border-slate-300 hover:bg-white"
-                            >
-                              <div>
-                                <p className="text-sm font-medium text-slate-900">{item.label}</p>
-                                <p className="mt-1 text-xs text-slate-500">
-                                  返回 {steps.find((step) => step.id === item.step)?.label}
-                                </p>
-                              </div>
-                              <ChevronRight className="h-4 w-4 text-slate-400" />
-                            </button>
-                          ))
+                          missingItems
+                            .filter((item) => item.step === "funding")
+                            .map((item) => (
+                              <button
+                                key={`${item.step}-${item.label}`}
+                                type="button"
+                                onClick={() => setActiveStep(item.step)}
+                                className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-left transition hover:border-slate-300 hover:bg-white"
+                              >
+                                <div>
+                                  <p className="text-sm font-medium text-slate-900">
+                                    {item.label}
+                                  </p>
+                                  <p className="mt-1 text-xs text-slate-500">
+                                    返回 {steps.find((step) => step.id === item.step)?.label}
+                                  </p>
+                                </div>
+                                <ChevronRight className="h-4 w-4 text-slate-400" />
+                              </button>
+                            ))
                         )}
                       </div>
                     </div>
@@ -1578,20 +2353,22 @@ export default function Home() {
                     <div className="rounded-2xl border border-slate-200 bg-white px-5 py-5">
                       <Field
                         label="复核备注"
-                        hint="客户在草稿 PDF 上指出的问题，可以先记在这里，重新导出时会保留到当前草稿。"
+                        hint="如果客户在检查版 PDF 上指出问题，可先记录在这里，便于回退修改。"
                       >
                         <textarea
                           className={textareaClassName}
                           value={formValues.reviewNotes}
                           onChange={(event) => updateField("reviewNotes", event.target.value)}
-                          placeholder="例如：第 2 页注册证书号码需更正；第 5 页持续资金来源应补充“投资收入”。"
+                          placeholder="例如：第 2 页注册号码需要更正；授权人住址需补齐。"
                         />
                       </Field>
 
                       <div className="mt-4 flex flex-wrap gap-3">
                         <button
                           type="button"
-                          onClick={() => generatePdf("review")}
+                          onClick={() => {
+                            void generatePdf("review");
+                          }}
                           disabled={isGeneratingPdf}
                           className="inline-flex items-center gap-2 rounded-full bg-slate-950 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
                         >
@@ -1610,91 +2387,19 @@ export default function Home() {
                           <RefreshCcw className="h-4 w-4" />
                           回到待补步骤
                         </button>
-                        {pdfUrl ? (
+                        {reviewPdfUrl ? (
                           <a
-                            href={pdfUrl}
+                            href={reviewPdfUrl}
                             download="company-account-review.pdf"
                             className="inline-flex items-center gap-2 rounded-full border border-emerald-300 bg-emerald-50 px-4 py-2.5 text-sm font-medium text-emerald-700 transition hover:border-emerald-400"
                           >
                             <BadgeCheck className="h-4 w-4" />
-                            下载当前草稿
+                            下载复核版
                           </a>
                         ) : null}
                       </div>
                     </div>
-                  </div>
 
-                  <div className="grid gap-4">
-                    <div className="rounded-2xl border border-slate-200 bg-white px-5 py-5">
-                      <div className="mb-4 flex items-center justify-between gap-3">
-                        <div>
-                          <h3 className="text-sm font-semibold text-slate-900">{pdfLabel}</h3>
-                          <p className="mt-1 text-xs text-slate-500">
-                            直接嵌入预览，便于逐页核对。
-                          </p>
-                        </div>
-                        {pdfUrl ? (
-                          <a
-                            href={pdfUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:border-slate-400"
-                          >
-                            新窗口查看
-                            <ArrowRight className="h-3.5 w-3.5" />
-                          </a>
-                        ) : null}
-                      </div>
-                      {pdfUrl ? (
-                        <iframe
-                          title="Review PDF"
-                          src={pdfUrl}
-                          className="h-[680px] w-full rounded-xl border border-slate-200 bg-slate-50"
-                        />
-                      ) : (
-                        <div className="grid gap-4 lg:grid-cols-2">
-                          {previewDeck.map((preview) => (
-                            <div
-                              key={preview.src}
-                              className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50"
-                            >
-                              <div className="relative aspect-[0.82] w-full bg-slate-100">
-                                <Image
-                                  src={preview.src}
-                                  alt={preview.title}
-                                  fill
-                                  className="object-cover object-top"
-                                  sizes="(max-width: 1024px) 100vw, 22vw"
-                                />
-                              </div>
-                              <div className="px-4 py-3">
-                                <p className="text-sm font-semibold text-slate-900">
-                                  {preview.title}
-                                </p>
-                                <p className="mt-1 text-xs leading-5 text-slate-500">
-                                  {preview.subtitle}
-                                </p>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              </section>
-            ) : null}
-
-            {activeStep === "sign" ? (
-              <section className={`${panelClassName} px-5 py-5 sm:px-6 lg:px-8 lg:py-7`}>
-                <SectionHeading
-                  eyebrow="Step 5"
-                  title="电子签名并导出签署版 PDF"
-                  body="签署区对齐原表第 6 页客户确认签署栏，以及第 9 页公司盖章、见证人和日期区域。先完成签名，再生成最终版本。"
-                />
-
-                <div className="mt-6 grid gap-6 xl:grid-cols-[0.95fr_1.05fr]">
-                  <div className="grid gap-4">
                     <div className="grid gap-4 rounded-2xl border border-slate-200 bg-white px-5 py-5 md:grid-cols-2">
                       <Field label="客户签署姓名">
                         <input
@@ -1767,7 +2472,7 @@ export default function Home() {
                         <div>
                           <h3 className="text-sm font-semibold text-slate-900">电子签字板</h3>
                           <p className="mt-1 text-xs text-slate-500">
-                            这份签名会同时落到第 6 页和第 9 页的签署区域。
+                            这份签名会落到最终签署版申请文件中。
                           </p>
                         </div>
                         <button
@@ -1788,33 +2493,48 @@ export default function Home() {
                           ref={signatureRef}
                           onEnd={() => {
                             setSignaturePreview(signatureRef.current?.toDataUrl() ?? null);
-                            setStatusMessage("签名已捕捉，可导出签署版 PDF。");
+                            setStatusMessage("签名已捕捉，可生成签署版 PDF。");
                           }}
                         />
+                      </div>
+
+                      <div className="mt-3 flex items-center justify-between rounded-xl bg-slate-50 px-4 py-3">
+                        <span className="text-xs text-slate-500">当前签名状态</span>
+                        <span
+                          className={`inline-flex rounded-full px-2.5 py-1 text-[11px] font-medium ${
+                            signaturePreview
+                              ? "bg-emerald-50 text-emerald-700"
+                              : "bg-slate-200 text-slate-600"
+                          }`}
+                        >
+                          {signaturePreview ? "已捕捉签名" : "尚未签名"}
+                        </span>
                       </div>
 
                       <div className="mt-4 flex flex-wrap gap-3">
                         <button
                           type="button"
-                          onClick={() => generatePdf("final")}
+                          onClick={() => {
+                            void generatePdf("final");
+                          }}
                           disabled={isGeneratingPdf}
-                          className="inline-flex items-center gap-2 rounded-full bg-slate-950 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
+                          className="inline-flex items-center gap-2 rounded-full bg-emerald-600 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-slate-400"
                         >
                           {isGeneratingPdf ? (
                             <LoaderCircle className="h-4 w-4 animate-spin" />
                           ) : (
                             <ShieldCheck className="h-4 w-4" />
                           )}
-                          导出签署版 PDF
+                          生成签署版 PDF
                         </button>
-                        {pdfUrl ? (
+                        {signedPdfUrl ? (
                           <a
-                            href={pdfUrl}
+                            href={signedPdfUrl}
                             download="company-account-signed.pdf"
                             className="inline-flex items-center gap-2 rounded-full border border-emerald-300 bg-emerald-50 px-4 py-2.5 text-sm font-medium text-emerald-700 transition hover:border-emerald-400"
                           >
-                            <BadgeCheck className="h-4 w-4" />
-                            下载最新 PDF
+                            <FileCheck2 className="h-4 w-4" />
+                            下载签署版
                           </a>
                         ) : null}
                       </div>
@@ -1822,24 +2542,131 @@ export default function Home() {
                   </div>
 
                   <div className="grid gap-4">
+                    <div className="rounded-2xl border border-slate-200 bg-white px-5 py-5">
+                      <div className="mb-4 flex items-center justify-between gap-3">
+                        <div>
+                          <h3 className="text-sm font-semibold text-slate-900">
+                            {signedPdfUrl
+                              ? "签署版 PDF"
+                              : reviewPdfUrl
+                                ? "复核版 PDF"
+                                : "模板预览"}
+                          </h3>
+                          <p className="mt-1 text-xs text-slate-500">
+                            优先展示最新生成文件；未生成时展示模板页面参考。
+                          </p>
+                        </div>
+                        {signedPdfUrl ? (
+                          <a
+                            href={signedPdfUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:border-slate-400"
+                          >
+                            新窗口查看
+                            <ArrowRight className="h-3.5 w-3.5" />
+                          </a>
+                        ) : reviewPdfUrl ? (
+                          <a
+                            href={reviewPdfUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:border-slate-400"
+                          >
+                            新窗口查看
+                            <ArrowRight className="h-3.5 w-3.5" />
+                          </a>
+                        ) : null}
+                      </div>
+                      {signedPdfUrl || reviewPdfUrl ? (
+                        <iframe
+                          title="Generated PDF preview"
+                          src={signedPdfUrl ?? reviewPdfUrl ?? undefined}
+                          className="h-[760px] w-full rounded-xl border border-slate-200 bg-slate-50"
+                        />
+                      ) : (
+                        <div className="grid gap-4 lg:grid-cols-2">
+                          {previewDeck.map((preview) => (
+                            <div
+                              key={preview.src}
+                              className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50"
+                            >
+                              <div className="relative aspect-[0.82] w-full bg-slate-100">
+                                <Image
+                                  src={preview.src}
+                                  alt={preview.title}
+                                  fill
+                                  className="object-cover object-top"
+                                  sizes="(max-width: 1024px) 100vw, 22vw"
+                                />
+                              </div>
+                              <div className="px-4 py-3">
+                                <p className="text-sm font-semibold text-slate-900">
+                                  {preview.title}
+                                </p>
+                                <p className="mt-1 text-xs leading-5 text-slate-500">
+                                  {preview.subtitle}
+                                </p>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </section>
+            ) : null}
+
+            {activeStep === "sign" ? (
+              <section className={`${panelClassName} px-5 py-5 sm:px-6 lg:px-8 lg:py-7`}>
+                <SectionHeading
+                  eyebrow="Step 5"
+                  title="确认最终材料包，并发送到后台"
+                  body="这一页展示最终会发送到后台的完整材料包，包括签署版开户申请文件和所有支持文件。确认无误后，点击发送到后台。"
+                />
+
+                <div className="mt-6 grid gap-6 xl:grid-cols-[0.95fr_1.05fr]">
+                  <div className="grid gap-4">
                     <div className="rounded-2xl border border-slate-200 bg-slate-950 px-5 py-5 text-white">
-                      <h3 className="text-sm font-semibold">签署前确认</h3>
-                      <div className="mt-4 grid gap-3">
-                        <div className="rounded-xl border border-white/10 bg-white/6 px-4 py-3">
-                          <p className="text-xs text-white/55">投资目标</p>
-                          <p className="mt-1 text-sm text-white">{summary.objective || "未填写"}</p>
-                        </div>
-                        <div className="rounded-xl border border-white/10 bg-white/6 px-4 py-3">
-                          <p className="text-xs text-white/55">衍生品认知</p>
-                          <p className="mt-1 text-sm leading-6 text-white">
-                            {summary.derivativeKnowledge || "未选择"}
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <h3 className="text-sm font-semibold">最终申请文件</h3>
+                          <p className="mt-1 text-xs text-white/55">
+                            系统生成的签署版 PDF 会作为材料包主文件。
                           </p>
                         </div>
-                        <div className="rounded-xl border border-white/10 bg-white/6 px-4 py-3">
-                          <p className="text-xs text-white/55">签名状态</p>
-                          <p className="mt-1 text-sm text-white">
-                            {signaturePreview ? "已捕捉签名图像" : "尚未签名"}
-                          </p>
+                        <span
+                          className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${
+                            signedReady
+                              ? "bg-emerald-100 text-emerald-700"
+                              : "bg-amber-100 text-amber-700"
+                          }`}
+                        >
+                          {signedReady ? "已就绪" : "待生成"}
+                        </span>
+                      </div>
+                      <div className="mt-4 rounded-xl border border-white/10 bg-white/6 px-4 py-4">
+                        <p className="text-sm font-semibold text-white">
+                          开户申请表、客户协议及风险取向问卷
+                        </p>
+                        <p className="mt-1 text-xs leading-5 text-white/65">
+                          由系统根据客户填写内容生成，并在第 4 步完成签字后入包。
+                        </p>
+                        <div className="mt-3 flex flex-wrap gap-3">
+                          {signedPdfUrl ? (
+                            <a
+                              href={signedPdfUrl}
+                              download="company-account-signed.pdf"
+                              className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/10 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-white/14"
+                            >
+                              <FileCheck2 className="h-3.5 w-3.5" />
+                              下载签署版
+                            </a>
+                          ) : null}
+                          <span className="inline-flex items-center gap-2 rounded-full bg-white/8 px-3 py-1.5 text-xs text-white/70">
+                            当前状态：{signedReady ? "已生成" : "尚未生成"}
+                          </span>
                         </div>
                       </div>
                     </div>
@@ -1847,38 +2674,148 @@ export default function Home() {
                     <div className="rounded-2xl border border-slate-200 bg-white px-5 py-5">
                       <div className="mb-4 flex items-center justify-between gap-3">
                         <div>
-                          <h3 className="text-sm font-semibold text-slate-900">签署区预览</h3>
+                          <h3 className="text-sm font-semibold text-slate-900">支持文件清单</h3>
                           <p className="mt-1 text-xs text-slate-500">
-                            使用原始表格的第 6 页与第 9 页页面示意。
+                            下列文件会和签署版申请文件一起发送到后台。
+                          </p>
+                        </div>
+                        <span className="text-xs text-slate-500">{documents.length} 份文件</span>
+                      </div>
+                      <div className="grid gap-3">
+                        {initialUploadMaterialRequirements.map((requirement) => {
+                          const requirementDocuments =
+                            documentsByRequirement.get(requirement.key) ?? [];
+                          return (
+                            <div
+                              key={requirement.key}
+                              className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-4"
+                            >
+                              <div className="flex items-center justify-between gap-3">
+                                <div>
+                                  <p className="text-sm font-semibold text-slate-900">
+                                    {requirement.label}
+                                  </p>
+                                  {requirement.note ? (
+                                    <p className="mt-1 text-xs text-slate-500">
+                                      {requirement.note}
+                                    </p>
+                                  ) : null}
+                                </div>
+                                <span
+                                  className={`inline-flex rounded-full px-2.5 py-1 text-[11px] font-medium ${
+                                    requirementDocuments.length > 0
+                                      ? "bg-emerald-50 text-emerald-700"
+                                      : "bg-slate-200 text-slate-600"
+                                  }`}
+                                >
+                                  {requirementDocuments.length > 0
+                                    ? `${requirementDocuments.length} 份`
+                                    : "未上传"}
+                                </span>
+                              </div>
+                              {requirementDocuments.length > 0 ? (
+                                <div className="mt-3 grid gap-2">
+                                  {requirementDocuments.map((document) => (
+                                    <div
+                                      key={document.id}
+                                      className="rounded-lg bg-white px-3 py-2 text-xs text-slate-600"
+                                    >
+                                      {document.name}
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : null}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-4">
+                    <div className="rounded-2xl border border-slate-200 bg-white px-5 py-5">
+                      <div className="mb-4 flex items-center justify-between gap-3">
+                        <div>
+                          <h3 className="text-sm font-semibold text-slate-900">发送前确认</h3>
+                          <p className="mt-1 text-xs text-slate-500">
+                            发送动作会把当前表单、预填结果、支持文件清单和签署版申请文件状态一并落到后台。
                           </p>
                         </div>
                       </div>
-                      <div className="grid gap-4 sm:grid-cols-2">
-                        {previewDeck.slice(2).map((preview) => (
-                          <div
-                            key={preview.src}
-                            className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50"
-                          >
-                            <div className="relative aspect-[0.78] w-full bg-slate-100">
-                              <Image
-                                src={preview.src}
-                                alt={preview.title}
-                                fill
-                                className="object-cover object-top"
-                                sizes="(max-width: 1024px) 100vw, 22vw"
-                              />
-                            </div>
-                            <div className="px-4 py-3">
-                              <p className="text-sm font-semibold text-slate-900">
-                                {preview.title}
-                              </p>
-                              <p className="mt-1 text-xs leading-5 text-slate-500">
-                                {preview.subtitle}
-                              </p>
-                            </div>
-                          </div>
-                        ))}
+                      <div className="grid gap-3">
+                        <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-4">
+                          <p className="text-xs text-slate-500">公司名称</p>
+                          <p className="mt-1 text-sm font-semibold text-slate-900">
+                            {formValues.companyNameEnglish || "未填写"}
+                          </p>
+                        </div>
+                        <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-4">
+                          <p className="text-xs text-slate-500">上传状态</p>
+                          <p className="mt-1 text-sm font-semibold text-slate-900">
+                            {uploadedRequirementCount}/{initialUploadMaterialRequirements.length} 项支持文件已上传
+                          </p>
+                        </div>
+                        <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-4">
+                          <p className="text-xs text-slate-500">签署状态</p>
+                          <p className="mt-1 text-sm font-semibold text-slate-900">
+                            {signedReady ? "签署版 PDF 已生成" : "尚未生成签署版 PDF"}
+                          </p>
+                        </div>
+                        <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-4">
+                          <p className="text-xs text-slate-500">后台状态</p>
+                          <p className="mt-1 text-sm font-semibold text-slate-900">
+                            {backendDetail}
+                          </p>
+                        </div>
                       </div>
+
+                      <div className="mt-5 flex flex-wrap gap-3">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void submitPackage();
+                          }}
+                          disabled={isSubmittingPackage || packageSubmitted}
+                          className="inline-flex items-center gap-2 rounded-full bg-slate-950 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
+                        >
+                          {isSubmittingPackage ? (
+                            <LoaderCircle className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Send className="h-4 w-4" />
+                          )}
+                          {packageSubmitted ? "已发送到后台" : "确认发送到后台"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setActiveStep("review")}
+                          className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:border-slate-400 hover:text-slate-950"
+                        >
+                          <RefreshCcw className="h-4 w-4" />
+                          返回签署步骤
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="rounded-2xl border border-slate-200 bg-white px-5 py-5">
+                      <div className="mb-4 flex items-center justify-between gap-3">
+                        <div>
+                          <h3 className="text-sm font-semibold text-slate-900">申请文件预览</h3>
+                          <p className="mt-1 text-xs text-slate-500">
+                            当前会话内可直接查看最近生成的签署版文件。
+                          </p>
+                        </div>
+                      </div>
+                      {signedPdfUrl ? (
+                        <iframe
+                          title="Signed PDF preview"
+                          src={signedPdfUrl}
+                          className="h-[680px] w-full rounded-xl border border-slate-200 bg-slate-50"
+                        />
+                      ) : (
+                        <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-4 py-10 text-sm text-slate-500">
+                          尚未生成签署版 PDF。
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -1891,10 +2828,7 @@ export default function Home() {
                   <p className="text-sm font-semibold text-slate-900">
                     当前步骤：{steps.find((step) => step.id === activeStep)?.label}
                   </p>
-                  <p className="mt-1 text-xs leading-5 text-slate-500">
-                    {getStepValidationMessage(activeStep, formValues) ||
-                      "当前步骤必填项已齐，可以继续。"}
-                  </p>
+                  <p className="mt-1 text-xs leading-5 text-slate-500">{helperText}</p>
                 </div>
                 <div className="flex flex-wrap gap-3">
                   {activeStep !== "upload" ? (
@@ -1926,9 +2860,9 @@ export default function Home() {
           <aside className="flex min-w-0 flex-col gap-6">
             <div className={`${panelClassName} overflow-hidden`}>
               <div className="border-b border-slate-200 px-5 py-4">
-                <h3 className="text-sm font-semibold text-slate-900">模板页面参考</h3>
+                <h3 className="text-sm font-semibold text-slate-900">模板与输出参考</h3>
                 <p className="mt-1 text-xs leading-5 text-slate-500">
-                  页面设计尽量贴近原始表单结构，方便客户理解最终 PDF 会长什么样。
+                  页面围绕原始开户表设计，生成文件仍直接使用原 PDF 模板。
                 </p>
               </div>
               <div className="grid gap-4 px-5 py-5">
@@ -1963,15 +2897,9 @@ export default function Home() {
                 <h3 className="text-sm font-semibold text-slate-900">当前实现边界</h3>
               </div>
               <ul className="mt-3 grid gap-3 text-sm leading-6 text-slate-600">
-                <li>
-                  文本型资料已经支持自动预填；图片类证照当前版本只保留原件，不做 OCR。
-                </li>
-                <li>
-                  最终 PDF 已直接复用原始空白模板，不是重新仿制版式。
-                </li>
-                <li>
-                  复核与签署链路已打通，下一步适合补服务端存储、权限控制和图像 OCR。
-                </li>
+                <li>文字型资料会优先参与自动摘取；图片类资料当前版本先做原件保存与归档展示。</li>
+                <li>最终发送到后台的主文件是系统生成的签署版 PDF，不需要客户在第一步上传。</li>
+                <li>支持文件、草稿状态、复核版和签署版 PDF 都会同步到 Supabase。</li>
               </ul>
             </div>
           </aside>

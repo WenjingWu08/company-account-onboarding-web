@@ -1,5 +1,6 @@
 import {
   accountTypeOptions,
+  initialUploadMaterialRequirements,
   createEmptyAuthorizedPerson,
   derivativeKnowledgeOptions,
   experienceRows,
@@ -10,6 +11,8 @@ import {
   steps,
   type AuthorizedPerson,
   type CompanyAccountFormValues,
+  type DocumentKind,
+  type MaterialRequirementKey,
   type PrefillFinding,
   type StepId,
   type UploadedDocument,
@@ -142,6 +145,16 @@ const detectFileExtension = (name: string) => {
   return parts.length > 1 ? parts.at(-1) ?? "" : "";
 };
 
+const isImageLikeFile = (file: File) => {
+  if (file.type.startsWith("image/")) {
+    return true;
+  }
+
+  return ["heic", "heif", "jpg", "jpeg", "png", "webp"].includes(
+    detectFileExtension(file.name),
+  );
+};
+
 const isReadableFile = (file: File) => {
   if (readableMimeTypes.has(file.type)) {
     return true;
@@ -237,6 +250,16 @@ const extractTextPayload = async (file: File) => {
     };
   }
 
+  if (isImageLikeFile(file)) {
+    return {
+      extractable: false,
+      findings: [] as PrefillFinding[],
+      patch: {} as Partial<CompanyAccountFormValues>,
+      parseNote: "已接收图像资料，当前版本先保存原件；自动摘取以文字型资料优先。",
+      text: "",
+    };
+  }
+
   return {
     extractable: false,
     findings: [] as PrefillFinding[],
@@ -326,6 +349,21 @@ export const mergePatchIntoValues = (
 };
 
 export const extractDocumentData = async (file: File): Promise<ExtractionResult> => {
+  return extractDocumentDataWithContext(file, {});
+};
+
+export const extractDocumentDataWithContext = async (
+  file: File,
+  {
+    kind = "supporting",
+    requirementKey = null,
+    requirementLabel = null,
+  }: {
+    kind?: DocumentKind;
+    requirementKey?: MaterialRequirementKey | null;
+    requirementLabel?: string | null;
+  },
+): Promise<ExtractionResult> => {
   const payload = await extractTextPayload(file);
   const normalizedText = normalizeWhitespace(payload.text);
   const regexResult = normalizedText
@@ -343,11 +381,18 @@ export const extractDocumentData = async (file: File): Promise<ExtractionResult>
       name: file.name,
       mimeType: file.type || "application/octet-stream",
       size: file.size,
+      kind,
+      requirementKey,
+      requirementLabel,
       extractable: payload.extractable,
       extractedTextSample: normalizedText.slice(0, 220),
       parseNote: payload.parseNote,
     },
-    findings,
+    findings: findings.map((finding) => ({
+      ...finding,
+      requirementKey,
+      requirementLabel,
+    })),
     patch: {
       ...payload.patch,
       ...regexResult.patch,
@@ -445,6 +490,10 @@ export const countCompletedExperiences = (values: CompanyAccountFormValues) =>
   experienceRows.filter((row) => values.experiences[row.key].enabled).length;
 
 export const todayString = () => new Date().toISOString().slice(0, 10);
+
+export const coreMaterialRequirementKeys = initialUploadMaterialRequirements
+  .filter((item) => item.applicability === "all")
+  .map((item) => item.key);
 
 export const safeJsonParse = <T>(value: string, fallback: T) => {
   try {

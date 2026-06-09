@@ -54,6 +54,45 @@ export type CommunicationMethod = "email" | "post";
 
 export type OpeningPurpose = "investment" | "other";
 
+export type MaterialRequirementKey =
+  | "applicationPackage"
+  | "crsForms"
+  | "certificateOfIncorporation"
+  | "memorandumAndArticles"
+  | "accountOpeningBoardResolution"
+  | "shareholdingChart"
+  | "latestAuditedFinancials"
+  | "uboIdentification"
+  | "additionalClientInformation"
+  | "w8Form"
+  | "professionalInvestorProof"
+  | "businessRegistration"
+  | "annualReturnAndChanges"
+  | "authorizedSignatoryResolution"
+  | "incumbencyOrGoodStanding"
+  | "directorIdentification"
+  | "authorizedPersonIdentification"
+  | "ssi";
+
+export type MaterialApplicability =
+  | "all"
+  | "generated"
+  | "hongKongOnly"
+  | "overseasOnly"
+  | "highRiskOnly"
+  | "professionalInvestorOnly";
+
+export type MaterialRequirement = {
+  key: MaterialRequirementKey;
+  label: string;
+  applicability: MaterialApplicability;
+  note?: string;
+  side: "left" | "right";
+  generated?: boolean;
+};
+
+export type DocumentKind = "supporting" | "generated";
+
 export type ExperienceEntry = {
   enabled: boolean;
   years: string;
@@ -127,9 +166,14 @@ export type UploadedDocument = {
   name: string;
   mimeType: string;
   size: number;
+  kind?: DocumentKind;
+  requirementKey?: MaterialRequirementKey | null;
+  requirementLabel?: string | null;
   extractable: boolean;
   extractedTextSample: string;
   parseNote: string;
+  storagePath?: string | null;
+  backendStoredAt?: string | null;
 };
 
 export type PrefillFinding = {
@@ -137,17 +181,146 @@ export type PrefillFinding = {
   label: string;
   value: string;
   source: string;
+  requirementKey?: MaterialRequirementKey | null;
+  requirementLabel?: string | null;
 };
 
 export type StepId = "upload" | "company" | "funding" | "review" | "sign";
 
+export type SubmissionStatus = "draft" | "review_ready" | "signed" | "submitted";
+
 export const steps: { id: StepId; label: string; hint: string }[] = [
-  { id: "upload", label: "资料上传", hint: "上传登记、证照与证明文件" },
-  { id: "company", label: "基础信息", hint: "填写公司、账户与联系人信息" },
-  { id: "funding", label: "资金与风险", hint: "完成资金来源、投资目标与经验" },
-  { id: "review", label: "复核回退", hint: "生成复核版 PDF 并定位修改" },
-  { id: "sign", label: "签署导出", hint: "电子签名并导出最终 PDF" },
+  { id: "upload", label: "资料上传", hint: "先收齐支持文件" },
+  { id: "company", label: "自动摘取", hint: "整理预填写命中结果" },
+  { id: "funding", label: "检查补全", hint: "核对并补全开户信息" },
+  { id: "review", label: "生成签署", hint: "生成 PDF、复核并签字" },
+  { id: "sign", label: "确认发送", hint: "确认材料包并提交后台" },
 ];
+
+export const materialRequirements: MaterialRequirement[] = [
+  {
+    key: "applicationPackage",
+    label: "开户申请表、客户协议及风险取向问卷",
+    applicability: "generated",
+    note: "由系统根据客户填写内容生成，不在首步上传。",
+    side: "left",
+    generated: true,
+  },
+  {
+    key: "crsForms",
+    label: "CRS E - 自我证明表格及 CRS CP - 自我证明表格",
+    applicability: "all",
+    side: "left",
+  },
+  {
+    key: "certificateOfIncorporation",
+    label: "公司注册之认证副本",
+    applicability: "all",
+    side: "left",
+  },
+  {
+    key: "memorandumAndArticles",
+    label: "公司组织及章程之认证副本",
+    applicability: "all",
+    side: "left",
+  },
+  {
+    key: "accountOpeningBoardResolution",
+    label: "决议与本公司开设户口的董事会决议之认证副本",
+    applicability: "all",
+    side: "left",
+  },
+  {
+    key: "shareholdingChart",
+    label: "公司的股权架构图（由董事签字）",
+    applicability: "all",
+    side: "left",
+  },
+  {
+    key: "latestAuditedFinancials",
+    label: "最新的公司审计报告之认证副本",
+    applicability: "highRiskOnly",
+    note: "适用于高风险客户",
+    side: "left",
+  },
+  {
+    key: "uboIdentification",
+    label: "持股25%或以上的最终受益人之身份证明文件及住址证明的认证副本",
+    applicability: "all",
+    side: "left",
+  },
+  {
+    key: "additionalClientInformation",
+    label:
+      "客户的额外资料，包括但不限于其业务、财富来源、资金来源、预期的户口活动等",
+    applicability: "highRiskOnly",
+    note: "适用于高风险客户",
+    side: "left",
+  },
+  {
+    key: "w8Form",
+    label: "W-8表格",
+    applicability: "all",
+    side: "right",
+  },
+  {
+    key: "professionalInvestorProof",
+    label: "专业投资者申请书及专业投资者资产证明",
+    applicability: "professionalInvestorOnly",
+    note: "如客户申请专业投资者身份时上传",
+    side: "right",
+  },
+  {
+    key: "businessRegistration",
+    label: "商业登记证之认证副本",
+    applicability: "hongKongOnly",
+    note: "适用于香港成立公司",
+    side: "right",
+  },
+  {
+    key: "annualReturnAndChanges",
+    label: "最新的公司年报及任何已在公司注册处登记的变更记录的认证副本",
+    applicability: "hongKongOnly",
+    note: "适用于香港成立公司",
+    side: "right",
+  },
+  {
+    key: "authorizedSignatoryResolution",
+    label: "授权人名单连签名样本的董事会决议之认证副本",
+    applicability: "all",
+    side: "right",
+  },
+  {
+    key: "incumbencyOrGoodStanding",
+    label:
+      "Certificate of Incumbency / Certificate of Good Standing 之认证副本",
+    applicability: "overseasOnly",
+    note: "适用于海外公司",
+    side: "right",
+  },
+  {
+    key: "directorIdentification",
+    label: "董事之身份证明文件及住址证明的认证副本",
+    applicability: "all",
+    side: "right",
+  },
+  {
+    key: "authorizedPersonIdentification",
+    label: "授权人之身份证明文件及住址证明的认证副本",
+    applicability: "all",
+    side: "right",
+  },
+  {
+    key: "ssi",
+    label: "SSI",
+    applicability: "all",
+    side: "right",
+  },
+];
+
+export const initialUploadMaterialRequirements = materialRequirements.filter(
+  (item) => !item.generated,
+);
 
 export const accountTypeOptions: {
   key: AccountTypeKey;
@@ -347,18 +520,18 @@ export const requiredFieldLabels: {
   label: string;
   step: StepId;
 }[] = [
-  { field: "companyNameChinese", label: "公司中文名称", step: "company" },
-  { field: "companyNameEnglish", label: "公司英文名称", step: "company" },
-  { field: "registeredAddress", label: "注册地址", step: "company" },
-  { field: "businessAddress", label: "营业地址", step: "company" },
-  { field: "incorporationNo", label: "注册成立证书号码", step: "company" },
-  { field: "incorporationDate", label: "注册日期", step: "company" },
-  { field: "contactPhone", label: "联络人电话", step: "company" },
-  { field: "email", label: "电邮地址", step: "company" },
+  { field: "companyNameChinese", label: "公司中文名称", step: "funding" },
+  { field: "companyNameEnglish", label: "公司英文名称", step: "funding" },
+  { field: "registeredAddress", label: "注册地址", step: "funding" },
+  { field: "businessAddress", label: "营业地址", step: "funding" },
+  { field: "incorporationNo", label: "注册成立证书号码", step: "funding" },
+  { field: "incorporationDate", label: "注册日期", step: "funding" },
+  { field: "contactPhone", label: "联络人电话", step: "funding" },
+  { field: "email", label: "电邮地址", step: "funding" },
   { field: "openingPurpose", label: "开户目的", step: "funding" },
   { field: "sourceRegion", label: "资金来源地", step: "funding" },
   { field: "investmentObjective", label: "投资目标", step: "funding" },
-  { field: "clientSignatureName", label: "客户签署姓名", step: "sign" },
-  { field: "authorizedSignatoryName", label: "获授权签署人", step: "sign" },
-  { field: "declarationDate", label: "签署日期", step: "sign" },
+  { field: "clientSignatureName", label: "客户签署姓名", step: "review" },
+  { field: "authorizedSignatoryName", label: "获授权签署人", step: "review" },
+  { field: "declarationDate", label: "签署日期", step: "review" },
 ];
