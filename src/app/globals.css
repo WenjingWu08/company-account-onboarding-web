@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f4f6f9;
+  --foreground: #111827;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  min-height: 100vh;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+iframe {
+  color-scheme: light;
+}
+
+.signature-canvas {
+  display: block;
+  width: 100%;
+  height: 260px;
+  background:
+    linear-gradient(180deg, rgba(241, 245, 249, 0.36) 0, rgba(241, 245, 249, 0.36) 1px, transparent 1px, transparent 40px),
+    linear-gradient(90deg, rgba(241, 245, 249, 0.2) 0, rgba(241, 245, 249, 0.2) 1px, transparent 1px, transparent 40px),
+    linear-gradient(180deg, #fffef7 0%, #fff9f0 100%);
+}
+
+::selection {
+  background: rgba(16, 185, 129, 0.18);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.45);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
