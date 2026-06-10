@@ -169,6 +169,7 @@ const normalizeExtractionText = (value: string) =>
 
 const minRecognizedTextLength = 12;
 const pdfOcrRenderScale = 2.75;
+const pdfWorkerSrc = "/pdfjs/pdf.worker.min.mjs";
 const ocrAssetPaths = {
   corePath: "/tesseract-core",
   langPath: "/tesseract-lang",
@@ -206,6 +207,7 @@ type OcrWorkerHandle = {
 };
 
 const ocrWorkerPromises = new Map<string, Promise<OcrWorkerHandle>>();
+let pdfJsPromise: Promise<typeof import("pdfjs-dist/legacy/build/pdf.mjs")> | null = null;
 
 const isImageLikeFile = (file: File) => {
   if (file.type.startsWith("image/")) {
@@ -259,6 +261,19 @@ const getOcrWorker = async (languages: string[]) => {
   return workerPromise;
 };
 
+const getPdfJs = async () => {
+  if (!pdfJsPromise) {
+    pdfJsPromise = import("pdfjs-dist/legacy/build/pdf.mjs");
+  }
+
+  const pdfjs = await pdfJsPromise;
+  if ("GlobalWorkerOptions" in pdfjs) {
+    pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerSrc;
+  }
+
+  return pdfjs;
+};
+
 const recognizeImageText = async (
   image: string | File,
   languages: string[] = ["eng", "chi_sim"],
@@ -273,7 +288,7 @@ const renderPdfPageToImage = async (file: File, pageNumber: number) => {
     throw new Error("OCR rendering is only available in the browser.");
   }
 
-  const { getDocument } = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const { getDocument } = await getPdfJs();
   const data = new Uint8Array(await file.arrayBuffer());
   const pdf = await getDocument({ data } as never).promise;
   const page = await pdf.getPage(pageNumber);
@@ -362,7 +377,7 @@ const extractPdfTextWithOcr = async (
     }
 
     const pageImages: string[] = [];
-    const { getDocument } = await import("pdfjs-dist/legacy/build/pdf.mjs");
+    const { getDocument } = await getPdfJs();
     const data = new Uint8Array(await file.arrayBuffer());
     const pdf = await getDocument({ data } as never).promise;
     const pageLimit = Math.min(pdf.numPages, 3);
@@ -449,7 +464,7 @@ const extractPdfTextWithOcr = async (
 };
 
 const extractPdfText = async (file: File) => {
-  const { getDocument } = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const { getDocument } = await getPdfJs();
   const data = new Uint8Array(await file.arrayBuffer());
   const pdf = await getDocument({ data } as never).promise;
   const pageLimit = Math.min(pdf.numPages, 8);
