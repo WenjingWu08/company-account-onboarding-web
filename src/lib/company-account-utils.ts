@@ -70,6 +70,8 @@ const prefillRules: {
       /(?:Name of Company|Company Name|Company English Name)[\s:：-]+([A-Z][A-Za-z0-9&.,()'\/ -]{4,80})/i,
       /(?:Name of Business\/Corporation|Name of Corporation|Business\/Corporation Name)[\s:：-]*([A-Z][A-Za-z0-9&.,()'\/ -]{4,120})/i,
       /(?:Name of Company|Company Name|Company English Name)[\s:：-]*\n+([A-Z][A-Za-z0-9&.,()'\/ -]{4,120})/i,
+      /(?:MEMORANDUM AND ARTICLES OF ASSOCIATION OF|ARTICLES OF ASSOCIATION OF|CERTIFICATE OF INCORPORATION OF)[\s\n]+([A-Z][A-Z0-9&.,()'\/ -]{4,160}(?:LIMITED|LTD\.?|CORPORATION|COMPANY))/i,
+      /\b([A-Z][A-Z0-9&.,()'\/ -]{4,160}(?:LIMITED|LTD\.?|CORPORATION|COMPANY))\b/,
     ],
   },
   {
@@ -110,6 +112,7 @@ const prefillRules: {
     patterns: [
       /(?:Certificate of Incorporation(?: No\.?)?|註冊成立證書號碼)[\s:：-]+([A-Z0-9\-\/]{5,40})/i,
       /(?:Company Number|No\. of Company|公司編號|公司编号|Certificate Number|Certificate No\.?)[\s:：-]*\n*([A-Z0-9\-\/]{5,40})/i,
+      /(?:No\.|Number)[\s:：-]*([A-Z0-9\-\/]{5,40})/i,
     ],
   },
   {
@@ -118,6 +121,7 @@ const prefillRules: {
     patterns: [
       /(?:Date of Incorporation|Incorporation Date|註冊日期)[\s:：-]+([0-9]{4}[-/.][0-9]{1,2}[-/.][0-9]{1,2}|[0-9]{1,2}[-/.][0-9]{1,2}[-/.][0-9]{2,4})/i,
       /(?:Date of Incorporation|Incorporation Date|Date of Registration|成立日期|註冊日期|注册日期)[\s:：-]*\n*([0-9]{4}[-/.][0-9]{1,2}[-/.][0-9]{1,2}|[0-9]{1,2}[-/.][0-9]{1,2}[-/.][0-9]{2,4})/i,
+      /(?:incorporated on|registered on)[\s:：-]*([0-9]{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+[0-9]{4}|[A-Za-z]+\s+[0-9]{1,2},\s*[0-9]{4})/i,
     ],
   },
   {
