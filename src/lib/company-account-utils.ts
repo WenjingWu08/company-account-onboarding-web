@@ -72,6 +72,7 @@ const prefillRules: {
       /(?:Name of Business\/Corporation|Name of Corporation|Business\/Corporation Name)[\s:：-]*([A-Z][A-Za-z0-9&.,()'\/ -]{4,120})/i,
       /(?:Name of Company|Company Name|Company English Name)[\s:：-]*\n+([A-Z][A-Za-z0-9&.,()'\/ -]{4,120})/i,
       /(?:MEMORANDUM AND ARTICLES OF ASSOCIATION OF|ARTICLES OF ASSOCIATION OF|CERTIFICATE OF INCORPORATION OF)[\s\n]+([A-Z][A-Z0-9&.,()'\/ -]{4,160}(?:LIMITED|LTD\.?|CORPORATION|COMPANY))/i,
+      /\b([A-Z][A-Za-z0-9&.,()'\/ -]{3,140}?(?:Limited|Ltd\.?|Corporation|Company))\b/i,
       /\b([A-Z][A-Z0-9&.,()'\/ -]{4,160}(?:LIMITED|LTD\.?|CORPORATION|COMPANY))\b/,
     ],
   },
@@ -169,8 +170,8 @@ const ocrAssetPaths = {
 } as const;
 const legalDocumentTitlePattern =
   /(memorandum and articles of association|articles of association|certificate of incorporation)/i;
-const companyLinePattern =
-  /^[A-Z0-9][A-Za-z0-9&.,()'\/ -]{3,160}(?:Limited|Ltd\.?|Corporation|Company)$/i;
+const companyInlinePattern =
+  /([A-Z][A-Za-z0-9&.,()'\/ -]{2,140}?(?:Limited|Ltd\.?|Corporation|Company))/i;
 const ignoredCompanyLines = [
   /corporate registrations limited/i,
   /registered agent/i,
@@ -193,10 +194,12 @@ const detectFileExtension = (name: string) => {
   return parts.length > 1 ? parts.at(-1) ?? "" : "";
 };
 
-let ocrWorkerPromise: Promise<{
+type OcrWorkerHandle = {
   recognize: (image: string | File) => Promise<{ data: { text: string } }>;
   setParameters: (params: Record<string, string>) => Promise<unknown>;
-}> | null = null;
+};
+
+const ocrWorkerPromises = new Map<string, Promise<OcrWorkerHandle>>();
 
 const isImageLikeFile = (file: File) => {
   if (file.type.startsWith("image/")) {
@@ -218,11 +221,16 @@ const isReadableFile = (file: File) => {
   );
 };
 
-const getOcrWorker = async () => {
-  if (!ocrWorkerPromise) {
-    ocrWorkerPromise = (async () => {
+const getOcrWorker = async (languages: string[]) => {
+  const key = languages.join("+");
+  const existing = ocrWorkerPromises.get(key);
+  if (existing) {
+    return existing;
+  }
+
+  const workerPromise = (async () => {
       const { createWorker } = await import("tesseract.js");
-      const worker = await createWorker(["eng", "chi_sim"], 1, {
+      const worker = await createWorker(languages, 1, {
         cachePath: "company-account-ocr",
         corePath: ocrAssetPaths.corePath,
         langPath: ocrAssetPaths.langPath,
@@ -237,18 +245,63 @@ const getOcrWorker = async () => {
 
       return worker;
     })().catch((error) => {
-      ocrWorkerPromise = null;
+      ocrWorkerPromises.delete(key);
       throw error;
     });
-  }
 
-  return ocrWorkerPromise;
+  ocrWorkerPromises.set(key, workerPromise);
+  return workerPromise;
 };
 
-const recognizeImageText = async (image: string | File) => {
-  const worker = await getOcrWorker();
-  const result = await worker.recognize(image);
-  return normalizeExtractionText(result.data.text);
+const readOcrErrorMessage = async (response: Response) => {
+  try {
+    const payload = (await response.json()) as { message?: string };
+    return payload.message ?? `OCR request failed with ${response.status}`;
+  } catch {
+    return `OCR request failed with ${response.status}`;
+  }
+};
+
+const dataUrlToFile = async (dataUrl: string, name: string) => {
+  const response = await fetch(dataUrl);
+  const blob = await response.blob();
+  return new File([blob], name, {
+    type: blob.type || "image/png",
+  });
+};
+
+const recognizeImageTextViaApi = async (image: File, languages: string[]) => {
+  const formData = new FormData();
+  formData.append("file", image);
+  formData.append("languages", JSON.stringify(languages));
+
+  const response = await fetch("/api/ocr", {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!response.ok) {
+    throw new Error(await readOcrErrorMessage(response));
+  }
+
+  const payload = (await response.json()) as { text?: string };
+  return normalizeExtractionText(payload.text ?? "");
+};
+
+const recognizeImageText = async (
+  image: string | File,
+  languages: string[] = ["eng", "chi_sim"],
+) => {
+  const ocrFile =
+    typeof image === "string" ? await dataUrlToFile(image, "ocr-source.png") : image;
+
+  try {
+    return await recognizeImageTextViaApi(ocrFile, languages);
+  } catch {
+    const worker = await getOcrWorker(languages);
+    const result = await worker.recognize(image);
+    return normalizeExtractionText(result.data.text);
+  }
 };
 
 const renderPdfPageToImage = async (file: File, pageNumber: number) => {
@@ -341,7 +394,7 @@ const extractPdfTextWithOcr = async (file: File): Promise<TextPayload> => {
 
     const ocrChunks: string[] = [];
     for (const image of pageImages) {
-      const chunk = await recognizeImageText(image);
+      const chunk = await recognizeImageText(image, ["eng", "chi_sim"]);
       if (chunk) {
         ocrChunks.push(chunk);
       }
@@ -349,15 +402,46 @@ const extractPdfTextWithOcr = async (file: File): Promise<TextPayload> => {
 
     const ocrText = normalizeExtractionText(ocrChunks.join("\n"));
     const hasOcrText = ocrText.replace(/\s/g, "").length >= minRecognizedTextLength;
+    const needsEnglishRetry =
+      !looksLikeCorporateName(ocrText) &&
+      /memorandum|articles|association|incorporation|limited|ltd/i.test(
+        file.name,
+      );
+
+    let finalOcrText = ocrText;
+    let usedEnglishRetry = false;
+
+    if (needsEnglishRetry) {
+      const englishChunks: string[] = [];
+      for (const image of pageImages) {
+        const chunk = await recognizeImageText(image, ["eng"]);
+        if (chunk) {
+          englishChunks.push(chunk);
+        }
+      }
+
+      const englishOcrText = normalizeExtractionText(englishChunks.join("\n"));
+      if (
+        englishOcrText.replace(/\s/g, "").length >= minRecognizedTextLength &&
+        looksLikeCorporateName(englishOcrText)
+      ) {
+        finalOcrText = englishOcrText;
+        usedEnglishRetry = true;
+      }
+    }
 
     return {
-      extractable: hasOcrText,
+      extractable:
+        finalOcrText.replace(/\s/g, "").length >= minRecognizedTextLength || hasOcrText,
       findings: [],
       patch: {},
-      parseNote: hasOcrText
-        ? "PDF 原文不可提取，已改用页面 OCR 并纳入自动预填写。"
+      parseNote:
+        finalOcrText.replace(/\s/g, "").length >= minRecognizedTextLength
+          ? usedEnglishRetry
+            ? "PDF 原文不可提取，已改用页面 OCR；英文版式已追加英文识别以提高命中率。"
+            : "PDF 原文不可提取，已改用页面 OCR 并纳入自动预填写。"
         : "PDF 原文不可提取，已尝试页面 OCR，但未识别到可用文本。",
-      text: ocrText,
+      text: finalOcrText,
       extractionMethod: "pdf-ocr",
     };
   } catch (error) {
@@ -630,6 +714,38 @@ const extractKeyValueFindings = (
   return { findings, patch };
 };
 
+const looksLikeCorporateName = (value: string) => {
+  const normalized = cleanMatchValue(value);
+  if (!normalized) {
+    return false;
+  }
+
+  if (!/(limited|ltd\.?|corporation|company)/i.test(normalized)) {
+    return false;
+  }
+
+  const alphaWords = normalized
+    .split(/\s+/)
+    .filter((token) => /[A-Za-z]{2,}/.test(token.replace(/[^A-Za-z]/g, "")));
+
+  return alphaWords.length >= 2;
+};
+
+const extractCompanyCandidate = (value: string) => {
+  const match = value.match(companyInlinePattern)?.[1] ?? "";
+  const normalized = cleanMatchValue(match || value);
+
+  if (!looksLikeCorporateName(normalized)) {
+    return "";
+  }
+
+  if (ignoredCompanyLines.some((pattern) => pattern.test(normalized))) {
+    return "";
+  }
+
+  return normalized;
+};
+
 const extractTitleBlockFindings = (
   text: string,
   source: string,
@@ -674,11 +790,9 @@ const extractTitleBlockFindings = (
         continue;
       }
 
-      if (
-        companyLinePattern.test(candidate) &&
-        !ignoredCompanyLines.some((pattern) => pattern.test(candidate))
-      ) {
-        pushFinding("companyNameEnglish", "公司英文名称", candidate);
+      const companyCandidate = extractCompanyCandidate(candidate);
+      if (companyCandidate) {
+        pushFinding("companyNameEnglish", "公司英文名称", companyCandidate);
         break;
       }
     }
@@ -689,11 +803,9 @@ const extractTitleBlockFindings = (
   }
 
   if (!patch.companyNameEnglish) {
-    const fallbackCompanyLine = lines.find(
-      (line) =>
-        companyLinePattern.test(line) &&
-        !ignoredCompanyLines.some((pattern) => pattern.test(line)),
-    );
+    const fallbackCompanyLine = lines
+      .map(extractCompanyCandidate)
+      .find(Boolean);
 
     if (fallbackCompanyLine) {
       pushFinding("companyNameEnglish", "公司英文名称", fallbackCompanyLine);
