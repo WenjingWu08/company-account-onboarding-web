@@ -44,7 +44,6 @@ import {
   entityTypeOptions,
   experienceRows,
   fundingSourceOptions,
-  initialUploadMaterialRequirements,
   investmentObjectiveOptions,
   materialRequirements,
   previewDeck,
@@ -75,13 +74,17 @@ import {
 } from "@/lib/submission-client";
 import type { SubmissionRecord } from "@/lib/submission-payload";
 import {
-  coreMaterialRequirementKeys,
   countCompletedExperiences,
   createInitialFormValues,
+  deriveCompanyIncorporationRegion,
   extractDocumentDataWithContext,
   formatBytes,
+  getApplicableMaterialRequirements,
+  getApplicableUploadMaterialRequirements,
+  getCoreMaterialRequirementKeys,
   getFirstIncompleteStep,
   getMissingItems,
+  getRequiredUploadMaterialRequirements,
   getStepValidationMessage,
   mergePatchIntoValues,
   stepIndex,
@@ -686,21 +689,65 @@ export default function Home() {
     return map;
   }, [documents]);
 
+  const companyRegion = useMemo(
+    () => deriveCompanyIncorporationRegion(formValues, { findings, documents }),
+    [documents, findings, formValues],
+  );
+  const applicableMaterialRequirements = useMemo(
+    () => getApplicableMaterialRequirements(formValues, { findings, documents }),
+    [documents, findings, formValues],
+  );
+  const applicableUploadRequirements = useMemo(
+    () => getApplicableUploadMaterialRequirements(formValues, { findings, documents }),
+    [documents, findings, formValues],
+  );
+  const requiredUploadRequirements = useMemo(
+    () => getRequiredUploadMaterialRequirements(formValues, { findings, documents }),
+    [documents, findings, formValues],
+  );
+  const applicableRequirementKeySet = useMemo(
+    () => new Set(applicableMaterialRequirements.map((item) => item.key)),
+    [applicableMaterialRequirements],
+  );
+  const visibleUploadRequirements = useMemo(() => {
+    const uploadedKeys = new Set(
+      documents
+        .map((document) => document.requirementKey)
+        .filter((key): key is MaterialRequirementKey => Boolean(key)),
+    );
+
+    return materialRequirements.filter(
+      (item) =>
+        !item.generated &&
+        (applicableRequirementKeySet.has(item.key) || uploadedKeys.has(item.key)),
+    );
+  }, [applicableRequirementKeySet, documents]);
+  const coreRequirementKeys = useMemo(
+    () => getCoreMaterialRequirementKeys(formValues, { findings, documents }),
+    [documents, findings, formValues],
+  );
   const summary = useMemo(() => summarizeSelections(formValues), [formValues]);
   const missingItems = useMemo(() => getMissingItems(formValues), [formValues]);
+  const missingRequiredUploadRequirements = useMemo(
+    () =>
+      requiredUploadRequirements.filter(
+        (item) => (documentsByRequirement.get(item.key) ?? []).length === 0,
+      ),
+    [documentsByRequirement, requiredUploadRequirements],
+  );
   const uploadedRequirementCount = useMemo(
     () =>
-      initialUploadMaterialRequirements.filter(
+      applicableUploadRequirements.filter(
         (item) => (documentsByRequirement.get(item.key) ?? []).length > 0,
       ).length,
-    [documentsByRequirement],
+    [applicableUploadRequirements, documentsByRequirement],
   );
   const coreUploadedCount = useMemo(
     () =>
-      coreMaterialRequirementKeys.filter(
+      coreRequirementKeys.filter(
         (key) => (documentsByRequirement.get(key) ?? []).length > 0,
       ).length,
-    [documentsByRequirement],
+    [coreRequirementKeys, documentsByRequirement],
   );
   const extractedFieldCount = useMemo(
     () => new Set(findings.map((finding) => finding.field)).size,
@@ -714,11 +761,36 @@ export default function Home() {
       submissionRecord?.status === "submitted",
   );
   const packageSubmitted = submissionRecord?.status === "submitted";
+  const companyRegionMeta = useMemo(() => {
+    if (companyRegion === "hongKong") {
+      return {
+        label: "香港公司",
+        note: "香港专属材料会按必需项处理。",
+        className: "bg-sky-100 text-sky-700",
+      };
+    }
+
+    if (companyRegion === "overseas") {
+      return {
+        label: "海外公司",
+        note: "香港专属材料当前可跳过，海外公司材料保留为必需项。",
+        className: "bg-violet-100 text-violet-700",
+      };
+    }
+
+    return {
+      label: "待确认",
+      note: "尚未稳定判断公司注册地，香港/海外专属项暂同时显示。",
+      className: "bg-amber-100 text-amber-700",
+    };
+  }, [companyRegion]);
 
   const completedSteps = useMemo<StepId[]>(() => {
     const done: StepId[] = [];
-    if (documents.length > 0) {
+    if (documents.length > 0 && missingRequiredUploadRequirements.length === 0) {
       done.push("upload");
+    }
+    if (documents.length > 0) {
       done.push("company");
     }
     if (!getStepValidationMessage("funding", formValues)) {
@@ -731,7 +803,13 @@ export default function Home() {
       done.push("sign");
     }
     return done;
-  }, [documents.length, formValues, packageSubmitted, signedReady]);
+  }, [
+    documents.length,
+    formValues,
+    missingRequiredUploadRequirements.length,
+    packageSubmitted,
+    signedReady,
+  ]);
 
   const progress = Math.round(((stepIndex(activeStep) + 1) / steps.length) * 100);
   const currentStepCard = stepCards[activeStep];
@@ -1066,6 +1144,23 @@ export default function Home() {
       return;
     }
 
+    const fundingValidation = getStepValidationMessage("funding", formValues);
+    if (fundingValidation) {
+      setErrorMessage(fundingValidation);
+      setActiveStep("funding");
+      return;
+    }
+
+    if (missingRequiredUploadRequirements.length > 0) {
+      setErrorMessage(
+        `仍有必需材料未上传：${missingRequiredUploadRequirements
+          .map((item) => item.label)
+          .join("、")}`,
+      );
+      setActiveStep("upload");
+      return;
+    }
+
     if (!signedReady) {
       setErrorMessage("请先生成签署版 PDF，再发送完整材料包。");
       setActiveStep("review");
@@ -1130,9 +1225,13 @@ export default function Home() {
 
   const helperText = useMemo(() => {
     if (activeStep === "upload") {
-      return documents.length > 0
-        ? `已上传 ${documents.length} 份支持文件，覆盖 ${uploadedRequirementCount} 个材料项。`
-        : "请先按清单上传支持文件。";
+      if (documents.length === 0) {
+        return "请先按清单上传支持文件。";
+      }
+
+      return missingRequiredUploadRequirements.length > 0
+        ? `已上传 ${documents.length} 份文件；仍有 ${missingRequiredUploadRequirements.length} 项必需材料未上传。`
+        : `必需材料已上传 ${uploadedRequirementCount}/${requiredUploadRequirements.length} 项。`;
     }
 
     if (activeStep === "company") {
@@ -1165,7 +1264,9 @@ export default function Home() {
     extractedFieldCount,
     findings.length,
     formValues,
+    missingRequiredUploadRequirements.length,
     packageSubmitted,
+    requiredUploadRequirements.length,
     reviewReady,
     signedReady,
     uploadedRequirementCount,
@@ -1209,8 +1310,8 @@ export default function Home() {
     }
   };
 
-  const leftRequirements = materialRequirements.filter((item) => item.side === "left");
-  const rightRequirements = materialRequirements.filter((item) => item.side === "right");
+  const leftRequirements = visibleUploadRequirements.filter((item) => item.side === "left");
+  const rightRequirements = visibleUploadRequirements.filter((item) => item.side === "right");
   const uploadRows = Array.from(
     { length: Math.max(leftRequirements.length, rightRequirements.length) },
     (_, index) => ({
@@ -1233,8 +1334,8 @@ export default function Home() {
 
   const metricCards = [
     {
-      label: "支持文件",
-      value: `${uploadedRequirementCount}/${initialUploadMaterialRequirements.length}`,
+      label: "必需材料",
+      value: `${uploadedRequirementCount}/${requiredUploadRequirements.length}`,
       accent: "from-amber-500/35 to-orange-500/10",
     },
     {
@@ -1408,11 +1509,12 @@ export default function Home() {
                     上传完成
                   </p>
                   <p className="mt-2 leading-6 text-slate-700">
-                    核心材料 {coreUploadedCount}/{coreMaterialRequirementKeys.length}
+                    核心材料 {coreUploadedCount}/{coreRequirementKeys.length}
                   </p>
                   <p className="mt-1 text-xs text-slate-500">
-                    总计 {uploadedRequirementCount}/{initialUploadMaterialRequirements.length}
+                    必需材料 {uploadedRequirementCount}/{requiredUploadRequirements.length}
                   </p>
+                  <p className="mt-2 text-xs text-slate-500">{companyRegionMeta.note}</p>
                 </div>
                 <div className="rounded-xl bg-slate-50 px-3 py-3">
                   <p className="text-xs font-medium uppercase tracking-[0.12em] text-slate-500">
@@ -1454,6 +1556,14 @@ export default function Home() {
                         <p className="mt-2 text-sm leading-7 text-slate-600">
                           支持文件按清单逐项上传即可。桌面端按左右两栏横向排列，尽量贴近原始材料清单；手机端会自动折成上下结构。文字型 PDF、TXT、CSV、JSON 会直接读取文本；扫描版 PDF、照片和截图会额外尝试 OCR 自动摘取。
                         </p>
+                        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                          <span
+                            className={`inline-flex rounded-full px-2.5 py-1 font-medium ${companyRegionMeta.className}`}
+                          >
+                            {companyRegionMeta.label}
+                          </span>
+                          <span className="text-slate-500">{companyRegionMeta.note}</span>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -1538,7 +1648,7 @@ export default function Home() {
                           {documents.length}
                         </p>
                         <p className="mt-1 text-xs text-slate-500">
-                          覆盖 {uploadedRequirementCount} 个材料项
+                          必需材料已完成 {uploadedRequirementCount}/{requiredUploadRequirements.length}
                         </p>
                       </div>
                       <div className="rounded-2xl border border-slate-200 bg-white px-4 py-4">
@@ -1561,6 +1671,15 @@ export default function Home() {
                         </p>
                         <p className="mt-1 text-xs text-slate-500">后续在检查补全步骤完成</p>
                       </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-3">
+                      <span
+                        className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${companyRegionMeta.className}`}
+                      >
+                        {companyRegionMeta.label}
+                      </span>
+                      <span className="text-xs text-slate-500">{companyRegionMeta.note}</span>
                     </div>
 
                     <div className="rounded-2xl border border-slate-200 bg-slate-950 px-5 py-5 text-white">
@@ -1778,7 +1897,14 @@ export default function Home() {
                   </div>
 
                   <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-                    <Field label="商业登记号码">
+                    <Field
+                      label="商业登记号码"
+                      hint={
+                        companyRegion === "overseas"
+                          ? "当前判断为海外公司，此项可留空。"
+                          : "适用于香港成立公司；如已自动命中，请核对后保留。"
+                      }
+                    >
                       <input
                         className={textInputClassName}
                         value={formValues.businessRegistrationNo}
@@ -2705,10 +2831,21 @@ export default function Home() {
                         </div>
                         <span className="text-xs text-slate-500">{documents.length} 份文件</span>
                       </div>
+                      <div className="mb-4 flex flex-wrap items-center gap-2">
+                        <span
+                          className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${companyRegionMeta.className}`}
+                        >
+                          {companyRegionMeta.label}
+                        </span>
+                        <span className="text-xs text-slate-500">{companyRegionMeta.note}</span>
+                      </div>
                       <div className="grid gap-3">
-                        {initialUploadMaterialRequirements.map((requirement) => {
+                        {visibleUploadRequirements.map((requirement) => {
                           const requirementDocuments =
                             documentsByRequirement.get(requirement.key) ?? [];
+                          const isRequired = requiredUploadRequirements.some(
+                            (item) => item.key === requirement.key,
+                          );
                           return (
                             <div
                               key={requirement.key}
@@ -2725,17 +2862,28 @@ export default function Home() {
                                     </p>
                                   ) : null}
                                 </div>
-                                <span
-                                  className={`inline-flex rounded-full px-2.5 py-1 text-[11px] font-medium ${
-                                    requirementDocuments.length > 0
-                                      ? "bg-emerald-50 text-emerald-700"
-                                      : "bg-slate-200 text-slate-600"
-                                  }`}
-                                >
-                                  {requirementDocuments.length > 0
-                                    ? `${requirementDocuments.length} 份`
-                                    : "未上传"}
-                                </span>
+                                <div className="flex flex-wrap items-center justify-end gap-2">
+                                  <span
+                                    className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                                      isRequired
+                                        ? "bg-rose-100 text-rose-700"
+                                        : "bg-slate-200 text-slate-600"
+                                    }`}
+                                  >
+                                    {isRequired ? "必需" : "可跳过"}
+                                  </span>
+                                  <span
+                                    className={`inline-flex rounded-full px-2.5 py-1 text-[11px] font-medium ${
+                                      requirementDocuments.length > 0
+                                        ? "bg-emerald-50 text-emerald-700"
+                                        : "bg-slate-200 text-slate-600"
+                                    }`}
+                                  >
+                                    {requirementDocuments.length > 0
+                                      ? `${requirementDocuments.length} 份`
+                                      : "未上传"}
+                                  </span>
+                                </div>
                               </div>
                               {requirementDocuments.length > 0 ? (
                                 <div className="mt-3 grid gap-2">
@@ -2776,8 +2924,15 @@ export default function Home() {
                         <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-4">
                           <p className="text-xs text-slate-500">上传状态</p>
                           <p className="mt-1 text-sm font-semibold text-slate-900">
-                            {uploadedRequirementCount}/{initialUploadMaterialRequirements.length} 项支持文件已上传
+                            {uploadedRequirementCount}/{requiredUploadRequirements.length} 项必需材料已上传
                           </p>
+                          {missingRequiredUploadRequirements.length > 0 ? (
+                            <p className="mt-1 text-xs text-amber-700">
+                              待补：{missingRequiredUploadRequirements.map((item) => item.label).join("、")}
+                            </p>
+                          ) : (
+                            <p className="mt-1 text-xs text-emerald-700">必需材料已齐。</p>
+                          )}
                         </div>
                         <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-4">
                           <p className="text-xs text-slate-500">签署状态</p>

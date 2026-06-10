@@ -1,17 +1,18 @@
 import {
   accountTypeOptions,
-  initialUploadMaterialRequirements,
   createEmptyAuthorizedPerson,
   derivativeKnowledgeOptions,
   experienceRows,
   fundingSourceOptions,
   initialCompanyAccountFormValues,
   investmentObjectiveOptions,
+  materialRequirements,
   requiredFieldLabels,
   steps,
   type AuthorizedPerson,
   type CompanyAccountFormValues,
   type DocumentKind,
+  type MaterialRequirement,
   type MaterialRequirementKey,
   type PrefillFinding,
   type StepId,
@@ -96,6 +97,7 @@ const prefillRules: {
     patterns: [
       /(?:Registered Office Address|Address of Registered Office in Country of Incorporation|成立國家之註冊地址|注册地址)[\s:：-]+([^\n]{8,140})/i,
       /(?:Registered Office|Registered Address|Address of Registered Office|註冊地址|注册地址)[\s:：-]*\n+([^\n]{8,180})/i,
+      /(?:registered office(?: of the company)?(?: shall)?(?: be)?(?: situated|located)?(?: at| in)?|registered agent(?:'s)? office(?: shall)?(?: be)?(?: situated|located)?(?: at| in)?)[\s:：-]*([A-Za-z0-9(),.'\/ -]{16,240}(?:Hong Kong|British Virgin Islands|BVI|Tortola|Road Town|Cayman Islands|Singapore))/i,
     ],
   },
   {
@@ -120,7 +122,6 @@ const prefillRules: {
     patterns: [
       /(?:Certificate of Incorporation(?: No\.?)?|註冊成立證書號碼)[\s:：-]+([A-Z0-9\-\/]{5,40})/i,
       /(?:Company Number|No\. of Company|公司編號|公司编号|Certificate Number|Certificate No\.?)[\s:：-]*\n*([A-Z0-9\-\/]{5,40})/i,
-      /(?:No\.|Number)[\s:：-]*([A-Z0-9\-\/]{5,40})/i,
     ],
   },
   {
@@ -170,6 +171,9 @@ const normalizeExtractionText = (value: string) =>
 const minRecognizedTextLength = 12;
 const pdfOcrRenderScale = 2.75;
 const pdfWorkerSrc = "/pdfjs/pdf.worker.min.mjs";
+type OcrPageSegMode = Tesseract.PSM;
+const defaultOcrPageSegMode = "3" as OcrPageSegMode;
+const sparseTextOcrPageSegMode = "11" as OcrPageSegMode;
 const ocrAssetPaths = {
   corePath: "/tesseract-core",
   langPath: "/tesseract-lang",
@@ -184,6 +188,194 @@ const ignoredCompanyLines = [
   /registered agent/i,
   /territory of the british virgin islands/i,
 ];
+const ignoredAddressPatterns = [
+  /i hereby certify/i,
+  /\bcopy\b/i,
+  /\bmember(ship)? no\b/i,
+  /\bbusiness companies act\b/i,
+  /\bmemorandum\b/i,
+  /\barticles\b/i,
+  /\bincorporated\b/i,
+  /\bdate\b/i,
+];
+const legalDocumentRequirementKeys = new Set<MaterialRequirementKey>([
+  "memorandumAndArticles",
+  "certificateOfIncorporation",
+  "businessRegistration",
+  "annualReturnAndChanges",
+  "incumbencyOrGoodStanding",
+]);
+const contextualFieldAllowlist: Partial<
+  Record<MaterialRequirementKey, (keyof CompanyAccountFormValues)[]>
+> = {
+  annualReturnAndChanges: ["companyNameEnglish", "registeredAddress"],
+  businessRegistration: [
+    "businessRegistrationNo",
+    "businessAddress",
+    "companyNameEnglish",
+    "registeredAddress",
+  ],
+  certificateOfIncorporation: [
+    "companyNameEnglish",
+    "incorporationDate",
+    "incorporationNo",
+  ],
+  incumbencyOrGoodStanding: [
+    "companyNameEnglish",
+    "incorporationNo",
+    "registeredAddress",
+  ],
+  memorandumAndArticles: [
+    "companyNameEnglish",
+    "companyNameChinese",
+    "incorporationDate",
+    "registeredAddress",
+  ],
+};
+const hongKongAddressPattern = /\b(hong kong|hk|kowloon|new territories)\b|香港|九龙|新界/i;
+const overseasAddressPattern =
+  /\b(british virgin islands|bvi|tortola|road town|cayman islands|singapore|seychelles|labuan|marshall islands|delaware|dubai|uae|united kingdom|england|scotland|wales)\b/i;
+const addressKeywordPattern =
+  /\b(road|rd|street|st|avenue|ave|house|building|tower|floor|room|suite|town|district|islands?|box)\b/i;
+const monthPattern =
+  /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)\b/i;
+const statuteNoisePattern =
+  /\b(act|ordinance|statute|section|article|schedule|chapter|cap\.?)\b/i;
+const registeredAddressLabelPattern =
+  /(?:registered office address|address of registered office(?: in country of incorporation)?|registered office|registered address|registered agent(?:'s)? office|註冊地址|注册地址)/i;
+const businessAddressLabelPattern =
+  /(?:business address|correspondence address|辦事處地址|营业地址|通信地址)/i;
+const businessRegistrationLabelPattern =
+  /(?:business registration(?: no\.?| number)?|br no\.?|香港商業登記號碼|商業登記號碼|商业登记号码)/i;
+const incorporationLabelPattern =
+  /(?:certificate of incorporation(?: no\.?)?|company number|no\. of company|certificate number|certificate no\.?|公司編號|公司编号|註冊成立證書號碼)/i;
+const addressLeadInPattern =
+  /^(?:registered office address|address of registered office(?: in country of incorporation)?|registered office|registered address|registered agent(?:'s)? office|business address|correspondence address|註冊地址|注册地址|辦事處地址|营业地址|通信地址)[\s:：-]*/i;
+const numericLikeOcrMap: Record<string, string> = {
+  B: "8",
+  D: "0",
+  G: "6",
+  I: "1",
+  L: "1",
+  O: "0",
+  Q: "0",
+  S: "5",
+  Z: "2",
+};
+
+export type CompanyIncorporationRegion = "unknown" | "hongKong" | "overseas";
+
+const normalizeAddressCandidate = (value: string) =>
+  flattenWhitespace(
+    value
+      .replace(addressLeadInPattern, "")
+      .replace(/^(?:is|shall be|will be|situated at|located at|at)\s+/i, "")
+      .replace(/[|]/g, " ")
+      .replace(/\s+,/g, ","),
+  ).replace(/[.;:,]+$/, "");
+
+const normalizeRegistrationCandidate = (
+  value: string,
+  { preferDigits = false }: { preferDigits?: boolean } = {},
+) => {
+  let normalized = value
+    .toUpperCase()
+    .replace(/[\s.,;:()]/g, "")
+    .replace(/^[^A-Z0-9]+/, "")
+    .replace(/[^A-Z0-9/-]+$/, "");
+
+  if (!preferDigits) {
+    return normalized;
+  }
+
+  const compact = normalized.replace(/[^A-Z0-9]/g, "");
+  const letterCount = compact.replace(/[^A-Z]/g, "").length;
+  const mayBeNumericToken =
+    compact.length > 0 &&
+    compact.split("").every((character) => /\d/.test(character) || numericLikeOcrMap[character]);
+
+  if (mayBeNumericToken && letterCount <= Math.ceil(compact.length * 0.35)) {
+    normalized = normalized.replace(/[BDGILOQSZ]/g, (character) => numericLikeOcrMap[character]);
+  }
+
+  return normalized;
+};
+
+const extractRegistrationTokens = (value: string, preferDigits = false) => {
+  const matches = value.match(/[A-Z0-9][A-Z0-9\-\/]{4,30}/gi) ?? [];
+
+  return Array.from(
+    new Set(
+      matches
+        .map((item) => normalizeRegistrationCandidate(item, { preferDigits }))
+        .filter(Boolean),
+    ),
+  );
+};
+
+const isLikelyRegistrationValue = (
+  value: string,
+  kind: "businessRegistration" | "incorporation",
+) => {
+  const compact = value.replace(/[^A-Z0-9]/g, "");
+
+  if (!compact || compact.length < 5 || compact.length > 24) {
+    return false;
+  }
+
+  if (/^\d{4}$/.test(compact)) {
+    return false;
+  }
+
+  if (/^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$/.test(value)) {
+    return false;
+  }
+
+  if (monthPattern.test(value) || /\bOF\d{4}\b/i.test(compact)) {
+    return false;
+  }
+
+  if (kind === "businessRegistration") {
+    return compact.length >= 6;
+  }
+
+  return compact.length >= 5;
+};
+
+const inferRegionFromAddressText = (value: string) => {
+  const normalized = normalizeAddressCandidate(value);
+  if (!normalized) {
+    return "unknown" as const;
+  }
+
+  const hasHongKongSignal = hongKongAddressPattern.test(normalized);
+  const hasOverseasSignal = overseasAddressPattern.test(normalized);
+
+  if (hasOverseasSignal && !hasHongKongSignal) {
+    return "overseas" as const;
+  }
+
+  if (hasHongKongSignal && !hasOverseasSignal) {
+    return "hongKong" as const;
+  }
+
+  return "unknown" as const;
+};
+
+const isRequirementApplicableForRegion = (
+  requirement: MaterialRequirement,
+  region: CompanyIncorporationRegion,
+) => {
+  if (requirement.applicability === "hongKongOnly") {
+    return region !== "overseas";
+  }
+
+  if (requirement.applicability === "overseasOnly") {
+    return region !== "hongKong";
+  }
+
+  return true;
+};
 
 const cleanMatchValue = (value: string) =>
   flattenWhitespace(value)
@@ -274,16 +466,32 @@ const getPdfJs = async () => {
   return pdfjs;
 };
 
+const isLegalDocumentContext = (context: ExtractionContext) =>
+  Boolean(context.requirementKey && legalDocumentRequirementKeys.has(context.requirementKey));
+
+const getAllowedFieldsForContext = (context: ExtractionContext) =>
+  context.requirementKey ? contextualFieldAllowlist[context.requirementKey] ?? null : null;
+
 const recognizeImageText = async (
   image: string | File,
   languages: string[] = ["eng", "chi_sim"],
+  {
+    pageSegMode = defaultOcrPageSegMode,
+  }: {
+    pageSegMode?: OcrPageSegMode;
+  } = {},
 ) => {
   const worker = await getOcrWorker(languages);
+  await worker.setParameters({
+    preserve_interword_spaces: "1",
+    tessedit_pageseg_mode: pageSegMode,
+    user_defined_dpi: "300",
+  });
   const result = await worker.recognize(image);
   return normalizeExtractionText(result.data.text);
 };
 
-const renderPdfPageToImage = async (file: File, pageNumber: number) => {
+const renderPdfPageToCanvas = async (file: File, pageNumber: number) => {
   if (typeof document === "undefined") {
     throw new Error("OCR rendering is only available in the browser.");
   }
@@ -309,6 +517,49 @@ const renderPdfPageToImage = async (file: File, pageNumber: number) => {
     viewport,
   }).promise;
 
+  return canvas;
+};
+
+const renderPdfPageToImage = async (file: File, pageNumber: number) => {
+  const canvas = await renderPdfPageToCanvas(file, pageNumber);
+  return canvas.toDataURL("image/png");
+};
+
+const cropCanvasToDataUrl = (
+  source: HTMLCanvasElement,
+  {
+    left,
+    top,
+    width,
+    height,
+  }: {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+  },
+) => {
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(source.width * width));
+  canvas.height = Math.max(1, Math.round(source.height * height));
+  const context = canvas.getContext("2d");
+
+  if (!context) {
+    throw new Error("Canvas context is unavailable.");
+  }
+
+  context.drawImage(
+    source,
+    Math.round(source.width * left),
+    Math.round(source.height * top),
+    Math.round(source.width * width),
+    Math.round(source.height * height),
+    0,
+    0,
+    canvas.width,
+    canvas.height,
+  );
+
   return canvas.toDataURL("image/png");
 };
 
@@ -326,6 +577,11 @@ const extractImageTextWithOcr = async (
     const text = await recognizeImageText(
       file,
       prefersEnglishPrimary ? ["eng"] : ["eng", "chi_sim"],
+      {
+        pageSegMode: prefersEnglishPrimary
+          ? sparseTextOcrPageSegMode
+          : defaultOcrPageSegMode,
+      },
     );
     const normalizedText = normalizeExtractionText(text);
     const hasText = normalizedText.replace(/\s/g, "").length >= minRecognizedTextLength;
@@ -376,7 +632,6 @@ const extractPdfTextWithOcr = async (
       };
     }
 
-    const pageImages: string[] = [];
     const { getDocument } = await getPdfJs();
     const data = new Uint8Array(await file.arrayBuffer());
     const pdf = await getDocument({ data } as never).promise;
@@ -389,18 +644,40 @@ const extractPdfTextWithOcr = async (
         contextText,
       );
 
-    for (let index = 1; index <= pageLimit; index += 1) {
-      pageImages.push(await renderPdfPageToImage(file, index));
-    }
-
     const ocrChunks: string[] = [];
-    for (const image of pageImages) {
+    for (let index = 1; index <= pageLimit; index += 1) {
+      const canvas = await renderPdfPageToCanvas(file, index);
+      const image = canvas.toDataURL("image/png");
       const chunk = await recognizeImageText(
         image,
         prefersEnglishPrimary ? ["eng"] : ["eng", "chi_sim"],
+        {
+          pageSegMode: prefersEnglishPrimary
+            ? defaultOcrPageSegMode
+            : sparseTextOcrPageSegMode,
+        },
       );
       if (chunk) {
         ocrChunks.push(chunk);
+      }
+
+      if (index === 1 && isLegalDocumentContext(context)) {
+        const addressFocusChunk = await recognizeImageText(
+          cropCanvasToDataUrl(canvas, {
+            left: 0.18,
+            top: 0.72,
+            width: 0.64,
+            height: 0.2,
+          }),
+          ["eng"],
+          {
+            pageSegMode: sparseTextOcrPageSegMode,
+          },
+        );
+
+        if (addressFocusChunk) {
+          ocrChunks.push(addressFocusChunk);
+        }
       }
     }
 
@@ -417,8 +694,11 @@ const extractPdfTextWithOcr = async (
 
     if (needsEnglishRetry) {
       const englishChunks: string[] = [];
-      for (const image of pageImages) {
-        const chunk = await recognizeImageText(image, ["eng"]);
+      for (let index = 1; index <= pageLimit; index += 1) {
+        const image = await renderPdfPageToImage(file, index);
+        const chunk = await recognizeImageText(image, ["eng"], {
+          pageSegMode: defaultOcrPageSegMode,
+        });
         if (chunk) {
           englishChunks.push(chunk);
         }
@@ -776,6 +1056,491 @@ const buildLineWindows = (lines: string[], maxWindowSize = 3) => {
   return windows;
 };
 
+const addressStructurePattern =
+  /\b(po box|box|chambers|plaza|centre|center|block|unit|flat|room|floor|tower|court|house|village|commercial|industrial|park|estate|road town|tortola|central|wan chai|tsim sha tsui)\b/i;
+const genericFieldLabelPattern =
+  /(?:name of company|company name|company english name|company chinese name|registered office|registered address|business address|correspondence address|business registration|br no\.?|company number|certificate of incorporation|certificate number|date of incorporation|nature of business|telephone|phone|email|fax|ccass|公司名稱|公司名称|中文名稱|中文名称|註冊地址|注册地址|辦事處地址|营业地址|商業登記|商业登记|公司編號|公司编号|聯絡人電話|联系人电话|电邮地址)/i;
+
+const formatDateToIso = (year: number, month: number, day: number) => {
+  if (
+    !Number.isInteger(year) ||
+    !Number.isInteger(month) ||
+    !Number.isInteger(day) ||
+    year < 1900 ||
+    year > 2100 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31
+  ) {
+    return "";
+  }
+
+  const candidate = new Date(Date.UTC(year, month - 1, day));
+  if (
+    candidate.getUTCFullYear() !== year ||
+    candidate.getUTCMonth() !== month - 1 ||
+    candidate.getUTCDate() !== day
+  ) {
+    return "";
+  }
+
+  return `${year.toString().padStart(4, "0")}-${month
+    .toString()
+    .padStart(2, "0")}-${day.toString().padStart(2, "0")}`;
+};
+
+const normalizeDateCandidate = (value: string) => {
+  const normalized = cleanMatchValue(value);
+
+  let match = normalized.match(/\b(\d{4})[./-](\d{1,2})[./-](\d{1,2})\b/);
+  if (match) {
+    return formatDateToIso(Number(match[1]), Number(match[2]), Number(match[3]));
+  }
+
+  match = normalized.match(/\b(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\b/);
+  if (match) {
+    const day = Number(match[1]);
+    const month = Number(match[2]);
+    const rawYear = Number(match[3]);
+    const year = rawYear < 100 ? 2000 + rawYear : rawYear;
+    return formatDateToIso(year, month, day);
+  }
+
+  const monthMap: Record<string, number> = {
+    jan: 1,
+    january: 1,
+    feb: 2,
+    february: 2,
+    mar: 3,
+    march: 3,
+    apr: 4,
+    april: 4,
+    may: 5,
+    jun: 6,
+    june: 6,
+    jul: 7,
+    july: 7,
+    aug: 8,
+    august: 8,
+    sep: 9,
+    sept: 9,
+    september: 9,
+    oct: 10,
+    october: 10,
+    nov: 11,
+    november: 11,
+    dec: 12,
+    december: 12,
+  };
+
+  match = normalized.match(
+    /\b(\d{1,2})(?:st|nd|rd|th)?(?:\s+day\s+of|\s+of|\s+)([A-Za-z]+),?\s+(\d{4})\b/i,
+  );
+  if (match) {
+    const month = monthMap[match[2].toLowerCase()];
+    if (month) {
+      return formatDateToIso(Number(match[3]), month, Number(match[1]));
+    }
+  }
+
+  match = normalized.match(/\b([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b/i);
+  if (match) {
+    const month = monthMap[match[1].toLowerCase()];
+    if (month) {
+      return formatDateToIso(Number(match[3]), month, Number(match[2]));
+    }
+  }
+
+  return "";
+};
+
+const normalizeFieldValue = (
+  field: keyof CompanyAccountFormValues,
+  value: string,
+) => {
+  const normalized = cleanMatchValue(value);
+
+  switch (field) {
+    case "registeredAddress":
+    case "businessAddress":
+      return normalizeAddressCandidate(normalized);
+    case "businessRegistrationNo":
+      return normalizeRegistrationCandidate(normalized, { preferDigits: true });
+    case "incorporationNo":
+      return normalizeRegistrationCandidate(normalized, { preferDigits: true });
+    case "incorporationDate":
+      return normalizeDateCandidate(normalized);
+    default:
+      return normalized;
+  }
+};
+
+const validateFieldValue = (
+  field: keyof CompanyAccountFormValues,
+  value: string,
+) => {
+  if (!value) {
+    return false;
+  }
+
+  switch (field) {
+    case "companyNameEnglish":
+      return looksLikeCorporateName(value);
+    case "companyNameChinese":
+      return /[\u4e00-\u9fff]{2,}/.test(value);
+    case "registeredAddress":
+    case "businessAddress":
+      return scoreAddressCandidate(value) >= 3;
+    case "businessRegistrationNo":
+      return isLikelyRegistrationValue(value, "businessRegistration");
+    case "incorporationNo":
+      return isLikelyRegistrationValue(value, "incorporation");
+    case "incorporationDate":
+      return Boolean(normalizeDateCandidate(value));
+    case "contactPhone":
+      return /[+\d()\- ][\d()\- ]{6,30}/.test(value);
+    case "email":
+      return /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(value);
+    default:
+      return true;
+  }
+};
+
+const getFieldLabel = (field: keyof CompanyAccountFormValues) =>
+  requiredFieldLabels.find((entry) => entry.field === field)?.label ??
+  prefillRules.find((entry) => entry.field === field)?.label ??
+  field;
+
+const sanitizeFinding = (finding: PrefillFinding): PrefillFinding | null => {
+  const normalizedValue = normalizeFieldValue(finding.field, finding.value);
+  if (!validateFieldValue(finding.field, normalizedValue)) {
+    return null;
+  }
+
+  return {
+    ...finding,
+    label: getFieldLabel(finding.field),
+    value: normalizedValue,
+  };
+};
+
+const scoreAddressCandidate = (value: string) => {
+  const normalized = normalizeAddressCandidate(value);
+  if (!normalized || normalized.length < 10 || normalized.length > 240) {
+    return -10;
+  }
+
+  let score = 0;
+  const commaCount = normalized.match(/,/g)?.length ?? 0;
+
+  if (/\d/.test(normalized)) {
+    score += 1;
+  }
+  if (addressKeywordPattern.test(normalized)) {
+    score += 2;
+  }
+  if (addressStructurePattern.test(normalized)) {
+    score += 2;
+  }
+  if (hongKongAddressPattern.test(normalized) || overseasAddressPattern.test(normalized)) {
+    score += 3;
+  }
+  if (commaCount >= 1) {
+    score += 1;
+  }
+  if (normalized.length >= 18 && normalized.length <= 180) {
+    score += 1;
+  }
+  if (ignoredAddressPatterns.some((pattern) => pattern.test(normalized))) {
+    score -= 5;
+  }
+  if (looksLikeCorporateName(normalized) && !addressKeywordPattern.test(normalized)) {
+    score -= 4;
+  }
+  if (statuteNoisePattern.test(normalized)) {
+    score -= 4;
+  }
+  if (
+    !/\d/.test(normalized) &&
+    !addressKeywordPattern.test(normalized) &&
+    !addressStructurePattern.test(normalized) &&
+    !hongKongAddressPattern.test(normalized) &&
+    !overseasAddressPattern.test(normalized)
+  ) {
+    score -= 4;
+  }
+
+  return score;
+};
+
+const isPotentialAddressLine = (line: string) => {
+  const normalized = normalizeAddressCandidate(line);
+  if (!normalized || ignoredAddressPatterns.some((pattern) => pattern.test(normalized))) {
+    return false;
+  }
+
+  if (genericFieldLabelPattern.test(normalized) && !registeredAddressLabelPattern.test(normalized)) {
+    if (!businessAddressLabelPattern.test(normalized)) {
+      return false;
+    }
+  }
+
+  return (
+    /\d/.test(normalized) ||
+    addressKeywordPattern.test(normalized) ||
+    addressStructurePattern.test(normalized) ||
+    hongKongAddressPattern.test(normalized) ||
+    overseasAddressPattern.test(normalized)
+  );
+};
+
+const collectContinuationLines = (
+  lines: string[],
+  startIndex: number,
+  maxLines = 3,
+) => {
+  const parts: string[] = [];
+
+  for (let offset = 1; offset <= maxLines; offset += 1) {
+    const line = lines[startIndex + offset];
+    if (!line) {
+      break;
+    }
+
+    if (genericFieldLabelPattern.test(line)) {
+      break;
+    }
+
+    const normalized = normalizeAddressCandidate(line);
+    if (!normalized || ignoredAddressPatterns.some((pattern) => pattern.test(normalized))) {
+      break;
+    }
+
+    if (!isPotentialAddressLine(normalized) && parts.length > 0) {
+      break;
+    }
+
+    if (!isPotentialAddressLine(normalized) && parts.length === 0) {
+      continue;
+    }
+
+    parts.push(normalized);
+  }
+
+  return parts;
+};
+
+const extractBestAddressCandidate = (
+  text: string,
+  field: "registeredAddress" | "businessAddress",
+) => {
+  const lines = normalizeExtractionText(text)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const labelPattern =
+    field === "registeredAddress" ? registeredAddressLabelPattern : businessAddressLabelPattern;
+
+  const candidates: { value: string; score: number }[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (!labelPattern.test(line)) {
+      continue;
+    }
+
+    const inline = normalizeAddressCandidate(line.replace(labelPattern, ""));
+    const continuation = collectContinuationLines(lines, index, 4);
+    const joined = normalizeAddressCandidate([inline, ...continuation].filter(Boolean).join(", "));
+    const score = scoreAddressCandidate(joined);
+    if (score >= 3) {
+      candidates.push({ value: joined, score: score + 3 });
+    }
+  }
+
+  for (const window of buildLineWindows(lines, 4)) {
+    const normalized = normalizeAddressCandidate(window);
+    const score = scoreAddressCandidate(normalized);
+    if (score >= 3) {
+      candidates.push({ value: normalized, score });
+    }
+  }
+
+  candidates.sort((first, second) => second.score - first.score);
+  return candidates[0]?.value ?? "";
+};
+
+const scoreRegistrationToken = (
+  token: string,
+  kind: "businessRegistration" | "incorporation",
+) => {
+  if (!isLikelyRegistrationValue(token, kind)) {
+    return -10;
+  }
+
+  const compact = token.replace(/[^A-Z0-9]/g, "");
+  let score = 0;
+
+  if (kind === "businessRegistration") {
+    if (/^\d{6,10}$/.test(compact)) {
+      score += 5;
+    }
+    if (compact.length >= 8 && compact.length <= 10) {
+      score += 2;
+    }
+  } else {
+    if (/^\d{5,12}$/.test(compact)) {
+      score += 3;
+    }
+    if (/[A-Z]/.test(compact)) {
+      score += 1;
+    }
+  }
+
+  if (compact.startsWith("20") && compact.length <= 8) {
+    score -= 2;
+  }
+  if (compact.includes("OF")) {
+    score -= 6;
+  }
+
+  return score;
+};
+
+const extractBestRegistrationCandidate = (
+  text: string,
+  kind: "businessRegistration" | "incorporation",
+) => {
+  const lines = normalizeExtractionText(text)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const labelPattern =
+    kind === "businessRegistration"
+      ? businessRegistrationLabelPattern
+      : incorporationLabelPattern;
+  const candidates: { value: string; score: number }[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (!labelPattern.test(line)) {
+      continue;
+    }
+
+    const inline = line.replace(labelPattern, " ");
+    const relatedLines = [inline, lines[index + 1] ?? "", lines[index + 2] ?? ""];
+    for (const part of relatedLines) {
+      if (!part || statuteNoisePattern.test(part)) {
+        continue;
+      }
+
+      for (const token of extractRegistrationTokens(part, true)) {
+        const score = scoreRegistrationToken(token, kind);
+        if (score >= 0) {
+          candidates.push({ value: token, score: score + 4 });
+        }
+      }
+    }
+  }
+
+  for (const line of lines) {
+    if (statuteNoisePattern.test(line)) {
+      continue;
+    }
+
+    for (const token of extractRegistrationTokens(line, true)) {
+      const score = scoreRegistrationToken(token, kind);
+      if (score >= 3) {
+        candidates.push({ value: token, score });
+      }
+    }
+  }
+
+  candidates.sort((first, second) => second.score - first.score);
+  return candidates[0]?.value ?? "";
+};
+
+const extractContextualFindings = (
+  text: string,
+  source: string,
+  context: ExtractionContext,
+): {
+  findings: PrefillFinding[];
+} => {
+  const findings: PrefillFinding[] = [];
+  const pushFinding = (field: keyof CompanyAccountFormValues, value: string) => {
+    if (!value) {
+      return;
+    }
+
+    findings.push({
+      field,
+      label: getFieldLabel(field),
+      value,
+      source,
+    });
+  };
+
+  if (!getAllowedFieldsForContext(context) || getAllowedFieldsForContext(context)?.includes("registeredAddress")) {
+    pushFinding("registeredAddress", extractBestAddressCandidate(text, "registeredAddress"));
+  }
+
+  if (!getAllowedFieldsForContext(context) || getAllowedFieldsForContext(context)?.includes("businessAddress")) {
+    pushFinding("businessAddress", extractBestAddressCandidate(text, "businessAddress"));
+  }
+
+  if (
+    !getAllowedFieldsForContext(context) ||
+    getAllowedFieldsForContext(context)?.includes("businessRegistrationNo")
+  ) {
+    pushFinding(
+      "businessRegistrationNo",
+      extractBestRegistrationCandidate(text, "businessRegistration"),
+    );
+  }
+
+  if (
+    !getAllowedFieldsForContext(context) ||
+    getAllowedFieldsForContext(context)?.includes("incorporationNo")
+  ) {
+    pushFinding("incorporationNo", extractBestRegistrationCandidate(text, "incorporation"));
+  }
+
+  return { findings };
+};
+
+const sanitizeFindings = (
+  findings: PrefillFinding[],
+  context: ExtractionContext,
+) => {
+  const allowedFields = getAllowedFieldsForContext(context);
+
+  return dedupeFindings(
+    findings
+      .filter((finding) =>
+        allowedFields ? allowedFields.includes(finding.field) : true,
+      )
+      .map(sanitizeFinding)
+      .filter((finding): finding is PrefillFinding => Boolean(finding)),
+  );
+};
+
+const buildPatchFromFindings = (findings: PrefillFinding[]) => {
+  const patch: Partial<CompanyAccountFormValues> = {};
+
+  for (const finding of findings) {
+    if (patch[finding.field]) {
+      continue;
+    }
+
+    patch[finding.field] = finding.value as never;
+  }
+
+  return patch;
+};
+
 const extractTitleBlockFindings = (
   text: string,
   source: string,
@@ -949,19 +1714,21 @@ export const extractDocumentDataWithContext = async (
   const keyValueResult = extractionText
     ? extractKeyValueFindings(extractionText, file.name)
     : { findings: [] as PrefillFinding[], patch: {} as Partial<CompanyAccountFormValues> };
+  const contextualResult = extractionText
+    ? extractContextualFindings(extractionText, file.name, context)
+    : { findings: [] as PrefillFinding[] };
 
-  const findings = dedupeFindings([
-    ...payload.findings,
-    ...regexResult.findings,
-    ...titleBlockResult.findings,
-    ...keyValueResult.findings,
-  ]);
-  const patch = {
-    ...payload.patch,
-    ...regexResult.patch,
-    ...keyValueResult.patch,
-    ...titleBlockResult.patch,
-  };
+  const findings = sanitizeFindings(
+    [
+      ...payload.findings,
+      ...contextualResult.findings,
+      ...titleBlockResult.findings,
+      ...keyValueResult.findings,
+      ...regexResult.findings,
+    ],
+    context,
+  );
+  const patch = buildPatchFromFindings(findings);
   const parseNote =
     findings.length > 0
       ? `${payload.parseNote} 已命中 ${findings.length} 项字段。`
@@ -999,6 +1766,106 @@ export const createInitialFormValues = () =>
 export const createBlankAuthorizedPersons = (count = 3): AuthorizedPerson[] =>
   Array.from({ length: count }, () => createEmptyAuthorizedPerson());
 
+export const deriveCompanyIncorporationRegion = (
+  values: CompanyAccountFormValues,
+  options?: {
+    findings?: PrefillFinding[];
+    documents?: UploadedDocument[];
+  },
+): CompanyIncorporationRegion => {
+  const addressCandidates = [
+    values.registeredAddress,
+    values.businessAddress,
+    ...(options?.findings
+      ?.filter(
+        (finding) =>
+          finding.field === "registeredAddress" || finding.field === "businessAddress",
+      )
+      .map((finding) => finding.value) ?? []),
+  ]
+    .map(normalizeAddressCandidate)
+    .filter(Boolean);
+
+  let hongKongSignals = 0;
+  let overseasSignals = 0;
+
+  for (const candidate of addressCandidates) {
+    const region = inferRegionFromAddressText(candidate);
+    if (region === "hongKong") {
+      hongKongSignals += 1;
+    } else if (region === "overseas") {
+      overseasSignals += 1;
+    }
+  }
+
+  if (hongKongSignals > 0 && overseasSignals === 0) {
+    return "hongKong";
+  }
+
+  if (overseasSignals > 0 && hongKongSignals === 0) {
+    return "overseas";
+  }
+
+  const requirementKeys = new Set(
+    options?.documents?.map((document) => document.requirementKey).filter(Boolean) ?? [],
+  );
+  if (
+    requirementKeys.has("businessRegistration") ||
+    requirementKeys.has("annualReturnAndChanges")
+  ) {
+    return "hongKong";
+  }
+  if (requirementKeys.has("incumbencyOrGoodStanding")) {
+    return "overseas";
+  }
+
+  return "unknown";
+};
+
+export const getApplicableMaterialRequirements = (
+  values: CompanyAccountFormValues,
+  options?: {
+    findings?: PrefillFinding[];
+    documents?: UploadedDocument[];
+  },
+) => {
+  const region = deriveCompanyIncorporationRegion(values, options);
+  return materialRequirements.filter((requirement) =>
+    isRequirementApplicableForRegion(requirement, region),
+  );
+};
+
+export const getApplicableUploadMaterialRequirements = (
+  values: CompanyAccountFormValues,
+  options?: {
+    findings?: PrefillFinding[];
+    documents?: UploadedDocument[];
+  },
+) =>
+  getApplicableMaterialRequirements(values, options).filter((item) => !item.generated);
+
+export const getRequiredUploadMaterialRequirements = (
+  values: CompanyAccountFormValues,
+  options?: {
+    findings?: PrefillFinding[];
+    documents?: UploadedDocument[];
+  },
+) =>
+  getApplicableUploadMaterialRequirements(values, options).filter((item) =>
+    ["all", "hongKongOnly", "overseasOnly"].includes(item.applicability),
+  );
+
+export const getCoreMaterialRequirementKeys = (
+  values: CompanyAccountFormValues,
+  options?: {
+    findings?: PrefillFinding[];
+    documents?: UploadedDocument[];
+  },
+) =>
+  getApplicableUploadMaterialRequirements(values, options)
+    .filter((item) => item.applicability === "all")
+    .map((item) => item.key);
+
 export const getMissingItems = (values: CompanyAccountFormValues) => {
   const missing = requiredFieldLabels.filter(({ field }) => {
     const value = values[field];
@@ -1031,6 +1898,60 @@ export const getMissingItems = (values: CompanyAccountFormValues) => {
     missing.push({
       field: "ongoingFundingSources",
       label: "持续资金来源",
+      step: "funding",
+    });
+  }
+
+  if (values.entityType === "other" && !values.entityTypeOther.trim()) {
+    missing.push({
+      field: "entityTypeOther",
+      label: "其他实体性质",
+      step: "funding",
+    });
+  }
+
+  if (values.openingPurpose === "other" && !values.openingPurposeOther.trim()) {
+    missing.push({
+      field: "openingPurposeOther",
+      label: "其他开户目的",
+      step: "funding",
+    });
+  }
+
+  if (values.sourceRegion === "other" && !values.sourceRegionOther.trim()) {
+    missing.push({
+      field: "sourceRegionOther",
+      label: "其他来源地",
+      step: "funding",
+    });
+  }
+
+  if (
+    values.initialFundingSources.includes("other") &&
+    !values.initialFundingOther.trim()
+  ) {
+    missing.push({
+      field: "initialFundingOther",
+      label: "初始资金来源其他说明",
+      step: "funding",
+    });
+  }
+
+  if (
+    values.ongoingFundingSources.includes("other") &&
+    !values.ongoingFundingOther.trim()
+  ) {
+    missing.push({
+      field: "ongoingFundingOther",
+      label: "持续资金来源其他说明",
+      step: "funding",
+    });
+  }
+
+  if (values.investmentObjective === "other" && !values.investmentObjectiveOther.trim()) {
+    missing.push({
+      field: "investmentObjectiveOther",
+      label: "其他投资目标说明",
       step: "funding",
     });
   }
@@ -1083,10 +2004,6 @@ export const countCompletedExperiences = (values: CompanyAccountFormValues) =>
   experienceRows.filter((row) => values.experiences[row.key].enabled).length;
 
 export const todayString = () => new Date().toISOString().slice(0, 10);
-
-export const coreMaterialRequirementKeys = initialUploadMaterialRequirements
-  .filter((item) => item.applicability === "all")
-  .map((item) => item.key);
 
 export const safeJsonParse = <T>(value: string, fallback: T) => {
   try {
