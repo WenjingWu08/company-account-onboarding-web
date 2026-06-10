@@ -172,6 +172,7 @@ export type UploadedDocument = {
   extractable: boolean;
   extractedTextSample: string;
   parseNote: string;
+  extractionMethod?: string | null;
   storagePath?: string | null;
   backendStoredAt?: string | null;
 };

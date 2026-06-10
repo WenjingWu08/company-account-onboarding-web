@@ -136,6 +136,13 @@ const panelClassName =
 const autosaveDelayMs = 900;
 const uploadAccept =
   ".pdf,.txt,.csv,.md,.markdown,.json,.jpg,.jpeg,.png,.webp,.heic,.heif,image/*";
+const extractionMethodLabels: Record<string, string> = {
+  json: "结构化数据",
+  text: "文本直读",
+  "pdf-text": "PDF 文本",
+  "pdf-ocr": "PDF OCR",
+  "image-ocr": "图片 OCR",
+};
 
 const applicabilityMeta: Record<
   MaterialApplicability,
@@ -1445,7 +1452,7 @@ export default function Home() {
                       <div>
                         <h3 className="text-lg font-semibold text-slate-950">材料上传规则</h3>
                         <p className="mt-2 text-sm leading-7 text-slate-600">
-                          支持文件按清单逐项上传即可。桌面端按左右两栏横向排列，尽量贴近原始材料清单；手机端会自动折成上下结构。文字型 PDF、TXT、CSV、JSON 会优先参与自动摘取，图片类资料当前版本先做原件保存和归档展示。
+                          支持文件按清单逐项上传即可。桌面端按左右两栏横向排列，尽量贴近原始材料清单；手机端会自动折成上下结构。文字型 PDF、TXT、CSV、JSON 会直接读取文本；扫描版 PDF、照片和截图会额外尝试 OCR 自动摘取。
                         </p>
                       </div>
                     </div>
@@ -1563,7 +1570,7 @@ export default function Home() {
                       </div>
                       {findingsByRequirement.length === 0 ? (
                         <p className="text-sm leading-6 text-white/68">
-                          当前还没有自动命中字段。图片类证照会先保存原件；如需更高命中率，优先上传文字型 PDF、CSV 或结构化 JSON。
+                          当前还没有自动命中字段。系统仍会保留原件并显示解析说明；如需更高命中率，优先上传清晰、正向、无遮挡的 PDF 或照片。
                         </p>
                       ) : (
                         <div className="grid gap-3">
@@ -1644,12 +1651,18 @@ export default function Home() {
                                       : "bg-slate-200 text-slate-600"
                                   }`}
                                 >
-                                  {document.extractable ? "已预填" : "仅归档"}
+                                  {document.extractable ? "已解析" : "仅归档"}
                                 </span>
                               </div>
-                              <p className="mt-2 text-xs leading-5 text-slate-500">
-                                {document.parseNote}
-                              </p>
+                              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                                {document.extractionMethod ? (
+                                  <span className="inline-flex rounded-full bg-white px-2 py-0.5 font-medium text-slate-600 ring-1 ring-slate-200">
+                                    {extractionMethodLabels[document.extractionMethod] ??
+                                      document.extractionMethod}
+                                  </span>
+                                ) : null}
+                                <span className="leading-5">{document.parseNote}</span>
+                              </div>
                               {document.extractedTextSample ? (
                                 <p className="mt-2 rounded-lg bg-white px-3 py-2 text-xs leading-5 text-slate-600">
                                   {document.extractedTextSample}

@@ -30,6 +30,7 @@ type TextPayload = {
   patch: Partial<CompanyAccountFormValues>;
   parseNote: string;
   text: string;
+  extractionMethod: string | null;
 };
 
 const readableMimeTypes = new Set([
@@ -160,6 +161,21 @@ const normalizeExtractionText = (value: string) =>
     .trim();
 
 const minRecognizedTextLength = 12;
+const pdfOcrRenderScale = 2.75;
+const ocrAssetPaths = {
+  corePath: "/tesseract-core",
+  langPath: "/tesseract-lang",
+  workerPath: "/tesseract/worker.min.js",
+} as const;
+const legalDocumentTitlePattern =
+  /(memorandum and articles of association|articles of association|certificate of incorporation)/i;
+const companyLinePattern =
+  /^[A-Z0-9][A-Za-z0-9&.,()'\/ -]{3,160}(?:Limited|Ltd\.?|Corporation|Company)$/i;
+const ignoredCompanyLines = [
+  /corporate registrations limited/i,
+  /registered agent/i,
+  /territory of the british virgin islands/i,
+];
 
 const cleanMatchValue = (value: string) =>
   flattenWhitespace(value)
@@ -207,7 +223,11 @@ const getOcrWorker = async () => {
     ocrWorkerPromise = (async () => {
       const { createWorker } = await import("tesseract.js");
       const worker = await createWorker(["eng", "chi_sim"], 1, {
+        cachePath: "company-account-ocr",
+        corePath: ocrAssetPaths.corePath,
+        langPath: ocrAssetPaths.langPath,
         logger: () => undefined,
+        workerPath: ocrAssetPaths.workerPath,
       });
 
       await worker.setParameters({
@@ -240,7 +260,7 @@ const renderPdfPageToImage = async (file: File, pageNumber: number) => {
   const data = new Uint8Array(await file.arrayBuffer());
   const pdf = await getDocument({ data } as never).promise;
   const page = await pdf.getPage(pageNumber);
-  const viewport = page.getViewport({ scale: 2 });
+  const viewport = page.getViewport({ scale: pdfOcrRenderScale });
   const canvas = document.createElement("canvas");
   const context = canvas.getContext("2d");
 
@@ -274,6 +294,7 @@ const extractImageTextWithOcr = async (file: File): Promise<TextPayload> => {
         ? "已完成图片 OCR，并纳入自动预填写。"
         : "已完成图片 OCR，但未识别到可用文本，原件已保留。",
       text: normalizedText,
+      extractionMethod: "image-ocr",
     };
   } catch (error) {
     return {
@@ -285,6 +306,7 @@ const extractImageTextWithOcr = async (file: File): Promise<TextPayload> => {
           ? `图片 OCR 启动失败，已保存原件：${error.message}`
           : "图片 OCR 启动失败，已保存原件。",
       text: "",
+      extractionMethod: "image-ocr",
     };
   }
 };
@@ -303,6 +325,7 @@ const extractPdfTextWithOcr = async (file: File): Promise<TextPayload> => {
         patch: {},
         parseNote: "已提取 PDF 文本并完成首轮字段匹配。",
         text: normalizedText,
+        extractionMethod: "pdf-text",
       };
     }
 
@@ -335,6 +358,7 @@ const extractPdfTextWithOcr = async (file: File): Promise<TextPayload> => {
         ? "PDF 原文不可提取，已改用页面 OCR 并纳入自动预填写。"
         : "PDF 原文不可提取，已尝试页面 OCR，但未识别到可用文本。",
       text: ocrText,
+      extractionMethod: "pdf-ocr",
     };
   } catch (error) {
     return {
@@ -346,6 +370,7 @@ const extractPdfTextWithOcr = async (file: File): Promise<TextPayload> => {
           ? `PDF OCR 处理失败，已保存原件：${error.message}`
           : "PDF OCR 处理失败，已保存原件。",
       text: "",
+      extractionMethod: "pdf-ocr",
     };
   }
 };
@@ -437,6 +462,7 @@ const extractTextPayload = async (file: File): Promise<TextPayload> => {
       patch: result.patch,
       parseNote: "已读取结构化资料并匹配字段。",
       text: result.raw,
+      extractionMethod: "json",
     };
   }
 
@@ -452,6 +478,7 @@ const extractTextPayload = async (file: File): Promise<TextPayload> => {
       patch: {} as Partial<CompanyAccountFormValues>,
       parseNote: "已读取文本内容并完成首轮字段匹配。",
       text: normalizeExtractionText(text),
+      extractionMethod: "text",
     };
   }
 
@@ -465,6 +492,7 @@ const extractTextPayload = async (file: File): Promise<TextPayload> => {
     patch: {} as Partial<CompanyAccountFormValues>,
     parseNote: "当前资料类型只做原件保存，不参与自动预填。",
     text: "",
+    extractionMethod: null,
   };
 };
 
@@ -602,6 +630,87 @@ const extractKeyValueFindings = (
   return { findings, patch };
 };
 
+const extractTitleBlockFindings = (
+  text: string,
+  source: string,
+): {
+  findings: PrefillFinding[];
+  patch: Partial<CompanyAccountFormValues>;
+} => {
+  const lines = normalizeExtractionText(text)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const findings: PrefillFinding[] = [];
+  const patch: Partial<CompanyAccountFormValues> = {};
+
+  const pushFinding = (
+    field: keyof CompanyAccountFormValues,
+    label: string,
+    value: string,
+  ) => {
+    const normalized = cleanMatchValue(value);
+    if (!normalized || patch[field]) {
+      return;
+    }
+
+    patch[field] = normalized as never;
+    findings.push({
+      field,
+      label,
+      value: normalized,
+      source,
+    });
+  };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!legalDocumentTitlePattern.test(lines[index])) {
+      continue;
+    }
+
+    for (let offset = 1; offset <= 4; offset += 1) {
+      const candidate = lines[index + offset];
+      if (!candidate || /^of$/i.test(candidate)) {
+        continue;
+      }
+
+      if (
+        companyLinePattern.test(candidate) &&
+        !ignoredCompanyLines.some((pattern) => pattern.test(candidate))
+      ) {
+        pushFinding("companyNameEnglish", "公司英文名称", candidate);
+        break;
+      }
+    }
+
+    if (patch.companyNameEnglish) {
+      break;
+    }
+  }
+
+  if (!patch.companyNameEnglish) {
+    const fallbackCompanyLine = lines.find(
+      (line) =>
+        companyLinePattern.test(line) &&
+        !ignoredCompanyLines.some((pattern) => pattern.test(line)),
+    );
+
+    if (fallbackCompanyLine) {
+      pushFinding("companyNameEnglish", "公司英文名称", fallbackCompanyLine);
+    }
+  }
+
+  const narrativeDateMatch = text.match(
+    /(?:incorporated(?: this)?|registered on)[\s:：-]*([0-9]{1,2}(?:st|nd|rd|th)?(?:\s+day\s+of)?\s+[A-Za-z]+,?\s+[0-9]{4}|[A-Za-z]+\s+[0-9]{1,2},\s*[0-9]{4})/i,
+  );
+
+  if (narrativeDateMatch?.[1]) {
+    pushFinding("incorporationDate", "注册日期", narrativeDateMatch[1]);
+  }
+
+  return { findings, patch };
+};
+
 const extractRegexFindings = (
   text: string,
   source: string,
@@ -691,6 +800,9 @@ export const extractDocumentDataWithContext = async (
   const regexResult = extractionText
     ? extractRegexFindings(extractionText, file.name)
     : { findings: [] as PrefillFinding[], patch: {} as Partial<CompanyAccountFormValues> };
+  const titleBlockResult = extractionText
+    ? extractTitleBlockFindings(extractionText, file.name)
+    : { findings: [] as PrefillFinding[], patch: {} as Partial<CompanyAccountFormValues> };
   const keyValueResult = extractionText
     ? extractKeyValueFindings(extractionText, file.name)
     : { findings: [] as PrefillFinding[], patch: {} as Partial<CompanyAccountFormValues> };
@@ -698,6 +810,7 @@ export const extractDocumentDataWithContext = async (
   const findings = dedupeFindings([
     ...payload.findings,
     ...regexResult.findings,
+    ...titleBlockResult.findings,
     ...keyValueResult.findings,
   ]);
 
@@ -712,6 +825,7 @@ export const extractDocumentDataWithContext = async (
       requirementLabel,
       extractable: payload.extractable,
       extractedTextSample: displayText.slice(0, 220),
+      extractionMethod: payload.extractionMethod,
       parseNote: payload.parseNote,
     },
     findings: findings.map((finding) => ({
@@ -723,6 +837,7 @@ export const extractDocumentDataWithContext = async (
       ...payload.patch,
       ...regexResult.patch,
       ...keyValueResult.patch,
+      ...titleBlockResult.patch,
     },
   };
 };
