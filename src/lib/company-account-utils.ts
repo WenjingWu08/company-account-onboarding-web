@@ -33,6 +33,12 @@ type TextPayload = {
   extractionMethod: string | null;
 };
 
+type ExtractionContext = {
+  kind?: DocumentKind;
+  requirementKey?: MaterialRequirementKey | null;
+  requirementLabel?: string | null;
+};
+
 const readableMimeTypes = new Set([
   "application/json",
   "application/pdf",
@@ -253,55 +259,13 @@ const getOcrWorker = async (languages: string[]) => {
   return workerPromise;
 };
 
-const readOcrErrorMessage = async (response: Response) => {
-  try {
-    const payload = (await response.json()) as { message?: string };
-    return payload.message ?? `OCR request failed with ${response.status}`;
-  } catch {
-    return `OCR request failed with ${response.status}`;
-  }
-};
-
-const dataUrlToFile = async (dataUrl: string, name: string) => {
-  const response = await fetch(dataUrl);
-  const blob = await response.blob();
-  return new File([blob], name, {
-    type: blob.type || "image/png",
-  });
-};
-
-const recognizeImageTextViaApi = async (image: File, languages: string[]) => {
-  const formData = new FormData();
-  formData.append("file", image);
-  formData.append("languages", JSON.stringify(languages));
-
-  const response = await fetch("/api/ocr", {
-    method: "POST",
-    body: formData,
-  });
-
-  if (!response.ok) {
-    throw new Error(await readOcrErrorMessage(response));
-  }
-
-  const payload = (await response.json()) as { text?: string };
-  return normalizeExtractionText(payload.text ?? "");
-};
-
 const recognizeImageText = async (
   image: string | File,
   languages: string[] = ["eng", "chi_sim"],
 ) => {
-  const ocrFile =
-    typeof image === "string" ? await dataUrlToFile(image, "ocr-source.png") : image;
-
-  try {
-    return await recognizeImageTextViaApi(ocrFile, languages);
-  } catch {
-    const worker = await getOcrWorker(languages);
-    const result = await worker.recognize(image);
-    return normalizeExtractionText(result.data.text);
-  }
+  const worker = await getOcrWorker(languages);
+  const result = await worker.recognize(image);
+  return normalizeExtractionText(result.data.text);
 };
 
 const renderPdfPageToImage = async (file: File, pageNumber: number) => {
@@ -333,9 +297,21 @@ const renderPdfPageToImage = async (file: File, pageNumber: number) => {
   return canvas.toDataURL("image/png");
 };
 
-const extractImageTextWithOcr = async (file: File): Promise<TextPayload> => {
+const extractImageTextWithOcr = async (
+  file: File,
+  context: ExtractionContext,
+): Promise<TextPayload> => {
   try {
-    const text = await recognizeImageText(file);
+    const prefersEnglishPrimary =
+      context.requirementKey === "memorandumAndArticles" ||
+      context.requirementKey === "certificateOfIncorporation" ||
+      /章程|注册证书|memorandum|articles|incorporation|certificate/i.test(
+        `${context.requirementLabel ?? ""} ${file.name}`,
+      );
+    const text = await recognizeImageText(
+      file,
+      prefersEnglishPrimary ? ["eng"] : ["eng", "chi_sim"],
+    );
     const normalizedText = normalizeExtractionText(text);
     const hasText = normalizedText.replace(/\s/g, "").length >= minRecognizedTextLength;
 
@@ -364,7 +340,10 @@ const extractImageTextWithOcr = async (file: File): Promise<TextPayload> => {
   }
 };
 
-const extractPdfTextWithOcr = async (file: File): Promise<TextPayload> => {
+const extractPdfTextWithOcr = async (
+  file: File,
+  context: ExtractionContext,
+): Promise<TextPayload> => {
   try {
     const text = await extractPdfText(file);
     const normalizedText = normalizeExtractionText(text);
@@ -387,6 +366,13 @@ const extractPdfTextWithOcr = async (file: File): Promise<TextPayload> => {
     const data = new Uint8Array(await file.arrayBuffer());
     const pdf = await getDocument({ data } as never).promise;
     const pageLimit = Math.min(pdf.numPages, 3);
+    const contextText = `${context.requirementLabel ?? ""} ${file.name}`;
+    const prefersEnglishPrimary =
+      context.requirementKey === "memorandumAndArticles" ||
+      context.requirementKey === "certificateOfIncorporation" ||
+      /章程|注册证书|memorandum|articles|association|incorporation|certificate/i.test(
+        contextText,
+      );
 
     for (let index = 1; index <= pageLimit; index += 1) {
       pageImages.push(await renderPdfPageToImage(file, index));
@@ -394,7 +380,10 @@ const extractPdfTextWithOcr = async (file: File): Promise<TextPayload> => {
 
     const ocrChunks: string[] = [];
     for (const image of pageImages) {
-      const chunk = await recognizeImageText(image, ["eng", "chi_sim"]);
+      const chunk = await recognizeImageText(
+        image,
+        prefersEnglishPrimary ? ["eng"] : ["eng", "chi_sim"],
+      );
       if (chunk) {
         ocrChunks.push(chunk);
       }
@@ -404,8 +393,8 @@ const extractPdfTextWithOcr = async (file: File): Promise<TextPayload> => {
     const hasOcrText = ocrText.replace(/\s/g, "").length >= minRecognizedTextLength;
     const needsEnglishRetry =
       !looksLikeCorporateName(ocrText) &&
-      /memorandum|articles|association|incorporation|limited|ltd/i.test(
-        file.name,
+      /章程|注册证书|memorandum|articles|association|incorporation|certificate|limited|ltd/i.test(
+        contextText,
       );
 
     let finalOcrText = ocrText;
@@ -537,7 +526,10 @@ const extractJsonPatch = async (file: File) => {
   return { findings, patch, raw };
 };
 
-const extractTextPayload = async (file: File): Promise<TextPayload> => {
+const extractTextPayload = async (
+  file: File,
+  context: ExtractionContext,
+): Promise<TextPayload> => {
   if (file.type === "application/json" || detectFileExtension(file.name) === "json") {
     const result = await extractJsonPatch(file);
     return {
@@ -551,7 +543,7 @@ const extractTextPayload = async (file: File): Promise<TextPayload> => {
   }
 
   if (file.type === "application/pdf" || detectFileExtension(file.name) === "pdf") {
-    return extractPdfTextWithOcr(file);
+    return extractPdfTextWithOcr(file, context);
   }
 
   if (isReadableFile(file)) {
@@ -567,7 +559,7 @@ const extractTextPayload = async (file: File): Promise<TextPayload> => {
   }
 
   if (isImageLikeFile(file)) {
-    return extractImageTextWithOcr(file);
+    return extractImageTextWithOcr(file, context);
   }
 
   return {
@@ -746,6 +738,29 @@ const extractCompanyCandidate = (value: string) => {
   return normalized;
 };
 
+const buildLineWindows = (lines: string[], maxWindowSize = 3) => {
+  const windows: string[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const parts: string[] = [];
+    for (
+      let offset = 0;
+      offset < maxWindowSize && index + offset < lines.length;
+      offset += 1
+    ) {
+      const candidate = lines[index + offset];
+      if (!candidate || /^of$/i.test(candidate) || candidate === ":") {
+        continue;
+      }
+
+      parts.push(candidate);
+      windows.push(parts.join(" "));
+    }
+  }
+
+  return windows;
+};
+
 const extractTitleBlockFindings = (
   text: string,
   source: string,
@@ -784,13 +799,9 @@ const extractTitleBlockFindings = (
       continue;
     }
 
-    for (let offset = 1; offset <= 4; offset += 1) {
-      const candidate = lines[index + offset];
-      if (!candidate || /^of$/i.test(candidate)) {
-        continue;
-      }
-
-      const companyCandidate = extractCompanyCandidate(candidate);
+    const nearbyWindows = buildLineWindows(lines.slice(index + 1, index + 5), 3);
+    for (const window of nearbyWindows) {
+      const companyCandidate = extractCompanyCandidate(window);
       if (companyCandidate) {
         pushFinding("companyNameEnglish", "公司英文名称", companyCandidate);
         break;
@@ -803,7 +814,7 @@ const extractTitleBlockFindings = (
   }
 
   if (!patch.companyNameEnglish) {
-    const fallbackCompanyLine = lines
+    const fallbackCompanyLine = buildLineWindows(lines, 3)
       .map(extractCompanyCandidate)
       .find(Boolean);
 
@@ -906,7 +917,12 @@ export const extractDocumentDataWithContext = async (
     requirementLabel?: string | null;
   },
 ): Promise<ExtractionResult> => {
-  const payload = await extractTextPayload(file);
+  const context = {
+    kind,
+    requirementKey,
+    requirementLabel,
+  };
+  const payload = await extractTextPayload(file, context);
   const extractionText = normalizeExtractionText(payload.text);
   const displayText = flattenWhitespace(payload.text);
   const regexResult = extractionText
@@ -925,6 +941,18 @@ export const extractDocumentDataWithContext = async (
     ...titleBlockResult.findings,
     ...keyValueResult.findings,
   ]);
+  const patch = {
+    ...payload.patch,
+    ...regexResult.patch,
+    ...keyValueResult.patch,
+    ...titleBlockResult.patch,
+  };
+  const parseNote =
+    findings.length > 0
+      ? `${payload.parseNote} 已命中 ${findings.length} 项字段。`
+      : payload.extractable
+        ? `${payload.parseNote} 当前未命中字段，请检查下方 OCR 原文。`
+        : payload.parseNote;
 
   return {
     document: {
@@ -938,19 +966,15 @@ export const extractDocumentDataWithContext = async (
       extractable: payload.extractable,
       extractedTextSample: displayText.slice(0, 220),
       extractionMethod: payload.extractionMethod,
-      parseNote: payload.parseNote,
+      matchedFieldCount: findings.length,
+      parseNote,
     },
     findings: findings.map((finding) => ({
       ...finding,
       requirementKey,
       requirementLabel,
     })),
-    patch: {
-      ...payload.patch,
-      ...regexResult.patch,
-      ...keyValueResult.patch,
-      ...titleBlockResult.patch,
-    },
+    patch,
   };
 };
 

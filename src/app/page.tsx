@@ -1661,12 +1661,20 @@ export default function Home() {
                                       document.extractionMethod}
                                   </span>
                                 ) : null}
+                                <span className="inline-flex rounded-full bg-white px-2 py-0.5 font-medium text-slate-600 ring-1 ring-slate-200">
+                                  命中 {document.matchedFieldCount ?? 0} 项
+                                </span>
                                 <span className="leading-5">{document.parseNote}</span>
                               </div>
                               {document.extractedTextSample ? (
-                                <p className="mt-2 rounded-lg bg-white px-3 py-2 text-xs leading-5 text-slate-600">
-                                  {document.extractedTextSample}
-                                </p>
+                                <div className="mt-2 rounded-lg bg-white px-3 py-2">
+                                  <p className="text-[11px] font-medium uppercase tracking-[0.12em] text-slate-400">
+                                    OCR / 解析片段
+                                  </p>
+                                  <p className="mt-1 text-xs leading-5 text-slate-600">
+                                    {document.extractedTextSample}
+                                  </p>
+                                </div>
                               ) : null}
                             </div>
                           ))

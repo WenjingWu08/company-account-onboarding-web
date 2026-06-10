@@ -173,6 +173,7 @@ export type UploadedDocument = {
   extractedTextSample: string;
   parseNote: string;
   extractionMethod?: string | null;
+  matchedFieldCount?: number;
   storagePath?: string | null;
   backendStoredAt?: string | null;
 };
