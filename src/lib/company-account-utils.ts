@@ -68,6 +68,8 @@ const prefillRules: {
     label: "公司英文名称",
     patterns: [
       /(?:Name of Company|Company Name|Company English Name)[\s:：-]+([A-Z][A-Za-z0-9&.,()'\/ -]{4,80})/i,
+      /(?:Name of Business\/Corporation|Name of Corporation|Business\/Corporation Name)[\s:：-]*([A-Z][A-Za-z0-9&.,()'\/ -]{4,120})/i,
+      /(?:Name of Company|Company Name|Company English Name)[\s:：-]*\n+([A-Z][A-Za-z0-9&.,()'\/ -]{4,120})/i,
     ],
   },
   {
@@ -75,6 +77,7 @@ const prefillRules: {
     label: "公司中文名称",
     patterns: [
       /(?:公司名稱|公司名称|中文名稱|Name in Chinese)[\s:：-]+([^\n]{2,40})/i,
+      /(?:公司名稱|公司名称|中文名稱|中文名称)[\s:：-]*\n+([^\n]{2,40})/i,
     ],
   },
   {
@@ -82,6 +85,7 @@ const prefillRules: {
     label: "注册地址",
     patterns: [
       /(?:Registered Office Address|Address of Registered Office in Country of Incorporation|成立國家之註冊地址|注册地址)[\s:：-]+([^\n]{8,140})/i,
+      /(?:Registered Office|Registered Address|Address of Registered Office|註冊地址|注册地址)[\s:：-]*\n+([^\n]{8,180})/i,
     ],
   },
   {
@@ -89,6 +93,7 @@ const prefillRules: {
     label: "营业地址",
     patterns: [
       /(?:Business Address|辦事處地址|营业地址)[\s:：-]+([^\n]{8,140})/i,
+      /(?:Business Address|Correspondence Address|辦事處地址|营业地址|通信地址)[\s:：-]*\n+([^\n]{8,180})/i,
     ],
   },
   {
@@ -96,6 +101,7 @@ const prefillRules: {
     label: "商业登记号码",
     patterns: [
       /(?:Business Registration(?: No\.?| Number)?|香港商業登記號碼)[\s:：-]+([A-Z0-9\-\/]{5,40})/i,
+      /(?:Business Registration No\.?|BR No\.?|商業登記號碼|商业登记号码|Business Registration Number)[\s:：-]*\n*([A-Z0-9\-\/]{5,40})/i,
     ],
   },
   {
@@ -103,6 +109,7 @@ const prefillRules: {
     label: "注册成立证书号码",
     patterns: [
       /(?:Certificate of Incorporation(?: No\.?)?|註冊成立證書號碼)[\s:：-]+([A-Z0-9\-\/]{5,40})/i,
+      /(?:Company Number|No\. of Company|公司編號|公司编号|Certificate Number|Certificate No\.?)[\s:：-]*\n*([A-Z0-9\-\/]{5,40})/i,
     ],
   },
   {
@@ -110,6 +117,7 @@ const prefillRules: {
     label: "注册日期",
     patterns: [
       /(?:Date of Incorporation|Incorporation Date|註冊日期)[\s:：-]+([0-9]{4}[-/.][0-9]{1,2}[-/.][0-9]{1,2}|[0-9]{1,2}[-/.][0-9]{1,2}[-/.][0-9]{2,4})/i,
+      /(?:Date of Incorporation|Incorporation Date|Date of Registration|成立日期|註冊日期|注册日期)[\s:：-]*\n*([0-9]{4}[-/.][0-9]{1,2}[-/.][0-9]{1,2}|[0-9]{1,2}[-/.][0-9]{1,2}[-/.][0-9]{2,4})/i,
     ],
   },
   {
@@ -117,6 +125,7 @@ const prefillRules: {
     label: "业务性质",
     patterns: [
       /(?:Nature of Business|业务性质|業務性質)[\s:：-]+([^\n]{2,80})/i,
+      /(?:Nature of Business|Principal Business Activity|业务性质|業務性質)[\s:：-]*\n+([^\n]{2,120})/i,
     ],
   },
   {
@@ -134,13 +143,22 @@ const prefillRules: {
   },
 ];
 
-const normalizeWhitespace = (value: string) =>
+const flattenWhitespace = (value: string) =>
   value.replace(/\s+/g, " ").replace(/[ ]+([,.;:])/g, "$1").trim();
+
+const normalizeExtractionText = (value: string) =>
+  value
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 
 const minRecognizedTextLength = 12;
 
 const cleanMatchValue = (value: string) =>
-  normalizeWhitespace(value)
+  flattenWhitespace(value)
     .replace(/^[-:：]+/, "")
     .replace(/\s*\(.*$/, "")
     .trim();
@@ -206,7 +224,7 @@ const getOcrWorker = async () => {
 const recognizeImageText = async (image: string | File) => {
   const worker = await getOcrWorker();
   const result = await worker.recognize(image);
-  return normalizeWhitespace(result.data.text);
+  return normalizeExtractionText(result.data.text);
 };
 
 const renderPdfPageToImage = async (file: File, pageNumber: number) => {
@@ -241,7 +259,7 @@ const renderPdfPageToImage = async (file: File, pageNumber: number) => {
 const extractImageTextWithOcr = async (file: File): Promise<TextPayload> => {
   try {
     const text = await recognizeImageText(file);
-    const normalizedText = normalizeWhitespace(text);
+    const normalizedText = normalizeExtractionText(text);
     const hasText = normalizedText.replace(/\s/g, "").length >= minRecognizedTextLength;
 
     return {
@@ -270,7 +288,7 @@ const extractImageTextWithOcr = async (file: File): Promise<TextPayload> => {
 const extractPdfTextWithOcr = async (file: File): Promise<TextPayload> => {
   try {
     const text = await extractPdfText(file);
-    const normalizedText = normalizeWhitespace(text);
+    const normalizedText = normalizeExtractionText(text);
     const hasReadableText =
       normalizedText.replace(/\s/g, "").length >= minRecognizedTextLength;
 
@@ -302,7 +320,7 @@ const extractPdfTextWithOcr = async (file: File): Promise<TextPayload> => {
       }
     }
 
-    const ocrText = normalizeWhitespace(ocrChunks.join("\n"));
+    const ocrText = normalizeExtractionText(ocrChunks.join("\n"));
     const hasOcrText = ocrText.replace(/\s/g, "").length >= minRecognizedTextLength;
 
     return {
@@ -338,14 +356,41 @@ const extractPdfText = async (file: File) => {
   for (let index = 1; index <= pageLimit; index += 1) {
     const page = await pdf.getPage(index);
     const content = await page.getTextContent();
-    chunks.push(
-      content.items
-        .map((item) => ("str" in item ? item.str : ""))
-        .join(" "),
-    );
+    const items = content.items
+      .map((item) =>
+        "str" in item
+          ? {
+              text: item.str,
+              y: Math.round(item.transform[5]),
+              x: item.transform[4],
+            }
+          : null,
+      )
+      .filter((item): item is { text: string; y: number; x: number } => Boolean(item))
+      .filter((item) => item.text.trim());
+
+    const rows = new Map<number, { text: string; x: number }[]>();
+    for (const item of items) {
+      const row = rows.get(item.y) ?? [];
+      row.push({ text: item.text, x: item.x });
+      rows.set(item.y, row);
+    }
+
+    const pageLines = Array.from(rows.entries())
+      .sort((first, second) => second[0] - first[0])
+      .map(([, row]) =>
+        row
+          .sort((first, second) => first.x - second.x)
+          .map((cell) => cell.text)
+          .join(" ")
+          .trim(),
+      )
+      .filter(Boolean);
+
+    chunks.push(pageLines.join("\n"));
   }
 
-  return normalizeWhitespace(chunks.join("\n"));
+  return normalizeExtractionText(chunks.join("\n"));
 };
 
 const extractJsonPatch = async (file: File) => {
@@ -360,7 +405,7 @@ const extractJsonPatch = async (file: File) => {
       continue;
     }
 
-    const normalized = normalizeWhitespace(value);
+    const normalized = flattenWhitespace(value);
     if (!normalized) {
       continue;
     }
@@ -402,7 +447,7 @@ const extractTextPayload = async (file: File): Promise<TextPayload> => {
       findings: [] as PrefillFinding[],
       patch: {} as Partial<CompanyAccountFormValues>,
       parseNote: "已读取文本内容并完成首轮字段匹配。",
-      text,
+      text: normalizeExtractionText(text),
     };
   }
 
@@ -429,6 +474,128 @@ const dedupeFindings = (items: PrefillFinding[]) => {
     seen.add(key);
     return true;
   });
+};
+
+const keyValueHints: {
+  field: keyof CompanyAccountFormValues;
+  label: string;
+  aliases: string[];
+  validator?: (value: string) => boolean;
+}[] = [
+  {
+    field: "companyNameEnglish",
+    label: "公司英文名称",
+    aliases: [
+      "Name of Company",
+      "Company Name",
+      "Company English Name",
+      "Name of Business/Corporation",
+      "Name of Corporation",
+    ],
+    validator: (value) => /[A-Za-z]{2,}/.test(value),
+  },
+  {
+    field: "companyNameChinese",
+    label: "公司中文名称",
+    aliases: ["公司名稱", "公司名称", "中文名稱", "中文名称"],
+    validator: (value) => /[\u4e00-\u9fff]{2,}/.test(value),
+  },
+  {
+    field: "businessRegistrationNo",
+    label: "商业登记号码",
+    aliases: ["Business Registration No", "BR No", "商業登記號碼", "商业登记号码"],
+    validator: (value) => /[A-Z0-9\-\/]{5,}/i.test(value),
+  },
+  {
+    field: "incorporationNo",
+    label: "注册成立证书号码",
+    aliases: ["Certificate of Incorporation No", "Company Number", "公司編號", "公司编号"],
+    validator: (value) => /[A-Z0-9\-\/]{5,}/i.test(value),
+  },
+  {
+    field: "incorporationDate",
+    label: "注册日期",
+    aliases: ["Date of Incorporation", "Incorporation Date", "成立日期", "註冊日期", "注册日期"],
+    validator: (value) =>
+      /[0-9]{4}[-/.][0-9]{1,2}[-/.][0-9]{1,2}|[0-9]{1,2}[-/.][0-9]{1,2}[-/.][0-9]{2,4}/.test(
+        value,
+      ),
+  },
+  {
+    field: "registeredAddress",
+    label: "注册地址",
+    aliases: ["Registered Office Address", "Registered Address", "註冊地址", "注册地址"],
+    validator: (value) => value.length >= 8,
+  },
+  {
+    field: "businessAddress",
+    label: "营业地址",
+    aliases: ["Business Address", "辦事處地址", "营业地址", "通信地址"],
+    validator: (value) => value.length >= 8,
+  },
+];
+
+const maybeExtractValueAfterAlias = (line: string, alias: string) => {
+  const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`${escaped}[\\s:：-]*(.+)$`, "i");
+  const match = line.match(pattern);
+  return cleanMatchValue(match?.[1] ?? "");
+};
+
+const extractKeyValueFindings = (
+  text: string,
+  source: string,
+): {
+  findings: PrefillFinding[];
+  patch: Partial<CompanyAccountFormValues>;
+} => {
+  const lines = normalizeExtractionText(text)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const findings: PrefillFinding[] = [];
+  const patch: Partial<CompanyAccountFormValues> = {};
+
+  for (const hint of keyValueHints) {
+    let candidate = "";
+
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index];
+      const nextLine = lines[index + 1] ?? "";
+      const alias = hint.aliases.find((item) => line.toLowerCase().includes(item.toLowerCase()));
+
+      if (!alias) {
+        continue;
+      }
+
+      candidate = maybeExtractValueAfterAlias(line, alias);
+      if (!candidate && nextLine) {
+        candidate = cleanMatchValue(nextLine);
+      }
+
+      if (candidate) {
+        break;
+      }
+    }
+
+    if (!candidate) {
+      continue;
+    }
+
+    if (hint.validator && !hint.validator(candidate)) {
+      continue;
+    }
+
+    patch[hint.field] = candidate as never;
+    findings.push({
+      field: hint.field,
+      label: hint.label,
+      value: candidate,
+      source,
+    });
+  }
+
+  return { findings, patch };
 };
 
 const extractRegexFindings = (
@@ -515,14 +682,19 @@ export const extractDocumentDataWithContext = async (
   },
 ): Promise<ExtractionResult> => {
   const payload = await extractTextPayload(file);
-  const normalizedText = normalizeWhitespace(payload.text);
-  const regexResult = normalizedText
-    ? extractRegexFindings(normalizedText, file.name)
+  const extractionText = normalizeExtractionText(payload.text);
+  const displayText = flattenWhitespace(payload.text);
+  const regexResult = extractionText
+    ? extractRegexFindings(extractionText, file.name)
+    : { findings: [] as PrefillFinding[], patch: {} as Partial<CompanyAccountFormValues> };
+  const keyValueResult = extractionText
+    ? extractKeyValueFindings(extractionText, file.name)
     : { findings: [] as PrefillFinding[], patch: {} as Partial<CompanyAccountFormValues> };
 
   const findings = dedupeFindings([
     ...payload.findings,
     ...regexResult.findings,
+    ...keyValueResult.findings,
   ]);
 
   return {
@@ -535,7 +707,7 @@ export const extractDocumentDataWithContext = async (
       requirementKey,
       requirementLabel,
       extractable: payload.extractable,
-      extractedTextSample: normalizedText.slice(0, 220),
+      extractedTextSample: displayText.slice(0, 220),
       parseNote: payload.parseNote,
     },
     findings: findings.map((finding) => ({
@@ -546,6 +718,7 @@ export const extractDocumentDataWithContext = async (
     patch: {
       ...payload.patch,
       ...regexResult.patch,
+      ...keyValueResult.patch,
     },
   };
 };
