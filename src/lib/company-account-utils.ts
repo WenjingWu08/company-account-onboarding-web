@@ -14,6 +14,8 @@ import {
   type DocumentKind,
   type MaterialRequirement,
   type MaterialRequirementKey,
+  type PrefillFieldDecision,
+  type PrefillFieldDecisionCandidate,
   type PrefillFinding,
   type StepId,
   type UploadedDocument,
@@ -169,11 +171,27 @@ const normalizeExtractionText = (value: string) =>
     .trim();
 
 const minRecognizedTextLength = 12;
-const pdfOcrRenderScale = 2.75;
+const pdfOcrRenderScale = 3.1;
+const constitutionPdfOcrRenderScale = 3.35;
 const pdfWorkerSrc = "/pdfjs/pdf.worker.min.mjs";
 type OcrPageSegMode = Tesseract.PSM;
 const defaultOcrPageSegMode = "3" as OcrPageSegMode;
 const sparseTextOcrPageSegMode = "11" as OcrPageSegMode;
+const blockTextOcrPageSegMode = "6" as OcrPageSegMode;
+type CanvasOcrVariant = "raw" | "autocontrast" | "threshold180" | "threshold160";
+type CanvasCropRect = {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+};
+type CanvasOcrPass = {
+  crop?: CanvasCropRect;
+  languages?: string[];
+  pageSegMode?: OcrPageSegMode;
+  variant?: CanvasOcrVariant;
+  upscale?: number;
+};
 const ocrAssetPaths = {
   corePath: "/tesseract-core",
   langPath: "/tesseract-lang",
@@ -205,6 +223,7 @@ const legalDocumentRequirementKeys = new Set<MaterialRequirementKey>([
   "annualReturnAndChanges",
   "incumbencyOrGoodStanding",
 ]);
+const constitutionRequirementKeys = new Set<MaterialRequirementKey>(["memorandumAndArticles"]);
 const contextualFieldAllowlist: Partial<
   Record<MaterialRequirementKey, (keyof CompanyAccountFormValues)[]>
 > = {
@@ -229,8 +248,20 @@ const contextualFieldAllowlist: Partial<
     "companyNameEnglish",
     "companyNameChinese",
     "incorporationDate",
+    "incorporationNo",
     "registeredAddress",
+    "authorizedShareCapital",
+    "authorizedShareCount",
+    "authorizedShareFaceValue",
   ],
+};
+const extractedFieldLabels: Partial<Record<keyof CompanyAccountFormValues, string>> = {
+  authorizedShareCapital: "法定股本",
+  authorizedShareCount: "法定股数",
+  authorizedShareFaceValue: "每股面值",
+  paidUpCapital: "实缴股本",
+  issuedShareCount: "已发行股数",
+  issuedShareFaceValue: "已发行每股面值",
 };
 const hongKongAddressPattern = /\b(hong kong|hk|kowloon|new territories)\b|香港|九龙|新界/i;
 const overseasAddressPattern =
@@ -262,6 +293,12 @@ const numericLikeOcrMap: Record<string, string> = {
   S: "5",
   Z: "2",
 };
+const registeredAgentLinePattern =
+  /(?:corporate registrations (?:limited|united)|registered agent)/i;
+const constitutionAddressSignalPattern =
+  /\b(?:sea meadow house|p\.?\s*o\.?\s*box|road town|tortola|british virgin islands|bvi)\b/i;
+const shareClauseSignalPattern =
+  /\b(?:authori[sz]ed|authorized|authorised|share capital|par value|no par value|shares?)\b/i;
 
 export type CompanyIncorporationRegion = "unknown" | "hongKong" | "overseas";
 
@@ -383,6 +420,182 @@ const cleanMatchValue = (value: string) =>
     .replace(/\s*\(.*$/, "")
     .trim();
 
+const normalizeOcrDigitFragment = (value: string) =>
+  value
+    .toUpperCase()
+    .replace(/[BDGILOQSZ]/g, (character) => numericLikeOcrMap[character] ?? character);
+
+const formatNumberWithGrouping = (value: number, fractionDigits = 0) =>
+  new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: fractionDigits,
+    maximumFractionDigits: fractionDigits,
+  }).format(value);
+
+const normalizeShareCountCandidate = (value: string) => {
+  const digits = normalizeOcrDigitFragment(value).replace(/[^0-9]/g, "");
+  if (!digits) {
+    return "";
+  }
+
+  const parsed = Number.parseInt(digits, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return "";
+  }
+
+  return formatNumberWithGrouping(parsed);
+};
+
+const normalizeCurrencyPrefix = (value: string) => {
+  if (/US\$|USD|US DOLLARS?/i.test(value)) {
+    return "US$";
+  }
+  if (/HK\$|HKD/i.test(value)) {
+    return "HK$";
+  }
+  if (/RMB|CNY|CNH/i.test(value)) {
+    return "RMB";
+  }
+  if (/GBP/i.test(value)) {
+    return "GBP ";
+  }
+  if (/EUR/i.test(value)) {
+    return "EUR ";
+  }
+  if (/SGD/i.test(value)) {
+    return "SGD ";
+  }
+  if (/\$/i.test(value)) {
+    return "$";
+  }
+  return "";
+};
+
+const normalizeMoneyCandidate = (value: string) => {
+  if (/\bno\s+par\s+value\b/i.test(value)) {
+    return "No par value";
+  }
+
+  const normalizedDigits = normalizeOcrDigitFragment(value);
+  const amountMatch = normalizedDigits.match(/\d[\d,]*(?:\.\d{1,4})?/);
+  if (!amountMatch) {
+    return "";
+  }
+
+  const amount = Number.parseFloat(amountMatch[0].replace(/,/g, ""));
+  if (!Number.isFinite(amount) || amount < 0) {
+    return "";
+  }
+
+  const decimals = amountMatch[0].includes(".")
+    ? Math.min(amountMatch[0].split(".")[1]?.length ?? 0, 2)
+    : 0;
+  const prefix = normalizeCurrencyPrefix(value);
+  const formatted = formatNumberWithGrouping(amount, decimals);
+  return prefix ? `${prefix}${formatted}` : formatted;
+};
+
+const parseNormalizedMoneyCandidate = (value: string) => {
+  const normalized = normalizeMoneyCandidate(value);
+  if (!normalized || normalized === "No par value") {
+    return null;
+  }
+
+  const amountMatch = normalized.match(/(\d[\d,]*(?:\.\d{1,2})?)$/);
+  if (!amountMatch) {
+    return null;
+  }
+
+  const amount = Number.parseFloat(amountMatch[1].replace(/,/g, ""));
+  if (!Number.isFinite(amount)) {
+    return null;
+  }
+
+  return {
+    normalized,
+    amount,
+    currency: normalizeCurrencyPrefix(normalized),
+    fractionDigits: amountMatch[1].includes(".")
+      ? amountMatch[1].split(".")[1]?.length ?? 0
+      : 0,
+  };
+};
+
+const deriveCapitalFromCountAndFaceValue = (
+  countValue: string,
+  faceValue: string,
+) => {
+  const count = Number.parseInt(countValue.replace(/,/g, ""), 10);
+  const money = parseNormalizedMoneyCandidate(faceValue);
+  if (!Number.isFinite(count) || count <= 0 || !money) {
+    return "";
+  }
+
+  const amount = count * money.amount;
+  const formatted = formatNumberWithGrouping(amount, Math.max(2, money.fractionDigits));
+  return money.currency ? `${money.currency}${formatted}` : formatted;
+};
+
+const normalizeConstitutionAddressCandidate = (value: string) => {
+  let normalized = normalizeAddressCandidate(value)
+    .replace(/corporate registrations united/gi, "Corporate Registrations Limited")
+    .replace(/\bSea\s+eadou\s+Howse\b/gi, "Sea Meadow House")
+    .replace(/\bSea\b[^,\n]{0,24}\bHouse\b/gi, "Sea Meadow House")
+    .replace(/(?<!Sea\s)\bMeadow\s+House\b/gi, "Sea Meadow House")
+    .replace(/\bTota\b/gi, "Tortola")
+    .replace(/\bTotola\b/gi, "Tortola")
+    .replace(/\bP\.?\s*O\.?\s*8ox\b/gi, "P.O. Box")
+    .replace(/\bP\.?\s*0\.?\s*Box\b/gi, "P.O. Box")
+    .replace(/\bP0\s*Box\b/gi, "P.O. Box")
+    .replace(/\bRout\s+ower\b/gi, "Road Town")
+    .replace(/\bR(?:oad|out)\s+T(?:own|owm|ower)\b/gi, "Road Town")
+    .replace(/\bih\s+Vegi\s+ands\b/gi, "British Virgin Islands")
+    .replace(/\bVegi\s+ands\b/gi, "British Virgin Islands");
+
+  normalized = normalized.replace(/^Corporate Registrations Limited,?\s*/i, "").trim();
+  normalized = normalized
+    .replace(/\bSea\s+Sea\s+Meadow\s+House\b/gi, "Sea Meadow House")
+    .replace(/\bRoad\s+Town,\s+Road\s+Town\b/gi, "Road Town")
+    .replace(/\bTortola,\s+Tortola\b/gi, "Tortola")
+    .replace(
+      /\bBritish\s+Virgin\s+Islands,\s+British\s+Virgin\s+Islands\b/gi,
+      "British Virgin Islands",
+    );
+
+  if (
+    /(sea meadow house|p\.?\s*o\.?\s*box)/i.test(normalized) &&
+    !/road town/i.test(normalized)
+  ) {
+    normalized = `${normalized}, Road Town`;
+  }
+  if (/road town/i.test(normalized) && !/tortola/i.test(normalized)) {
+    normalized = `${normalized}, Tortola`;
+  }
+  if (
+    /(road town|tortola|sea meadow house)/i.test(normalized) &&
+    !/british virgin islands|bvi/i.test(normalized)
+  ) {
+    normalized = `${normalized}, British Virgin Islands`;
+  }
+
+  return flattenWhitespace(normalized).replace(/[.;:,]+$/, "");
+};
+
+const isConstitutionContext = (context: ExtractionContext) =>
+  Boolean(context.requirementKey && constitutionRequirementKeys.has(context.requirementKey));
+
+const getPdfScanPageLimit = (numPages: number, context: ExtractionContext) => {
+  if (isConstitutionContext(context)) {
+    return Math.min(numPages, 8);
+  }
+  if (context.requirementKey === "annualReturnAndChanges") {
+    return Math.min(numPages, 5);
+  }
+  if (context.requirementKey === "businessRegistration") {
+    return Math.min(numPages, 4);
+  }
+  return Math.min(numPages, 3);
+};
+
 const buildDocumentId = () =>
   typeof crypto !== "undefined" && "randomUUID" in crypto
     ? crypto.randomUUID()
@@ -491,6 +704,97 @@ const recognizeImageText = async (
   return normalizeExtractionText(result.data.text);
 };
 
+const mergeOcrTextBlocks = (blocks: string[]) =>
+  normalizeExtractionText(
+    blocks
+      .map((block) => normalizeExtractionText(block))
+      .filter(Boolean)
+      .join("\n"),
+  );
+
+const scoreOcrTextCandidate = (text: string, context: ExtractionContext) => {
+  const normalized = normalizeExtractionText(text);
+  if (!normalized) {
+    return -1000;
+  }
+
+  const compactLength = normalized.replace(/\s/g, "").length;
+  let score = compactLength;
+  const lower = normalized.toLowerCase();
+
+  if (looksLikeCorporateName(normalized)) {
+    score += 80;
+  }
+
+  if (context.requirementKey === "memorandumAndArticles") {
+    if (/(memorandum|articles|association)/i.test(lower)) {
+      score += 90;
+    }
+    if (constitutionAddressSignalPattern.test(lower)) {
+      score += 40;
+    }
+    if (/incorporat|registered/i.test(lower)) {
+      score += 30;
+    }
+    if (shareClauseSignalPattern.test(lower)) {
+      score += 30;
+    }
+    if (/\b20\d{2}\b/.test(lower)) {
+      score += 20;
+    }
+    if (/\bday\s+of\b|\bdoy\s+of\b/i.test(lower)) {
+      score += 20;
+    }
+  } else if (isLegalDocumentContext(context)) {
+    if (legalDocumentTitlePattern.test(lower)) {
+      score += 70;
+    }
+    if (constitutionAddressSignalPattern.test(lower)) {
+      score += 20;
+    }
+    if (/\b20\d{2}\b/.test(lower)) {
+      score += 10;
+    }
+  }
+
+  return score;
+};
+
+const recognizeCanvasPasses = async (
+  canvas: HTMLCanvasElement,
+  passes: CanvasOcrPass[],
+  context: ExtractionContext,
+) => {
+  const chunks: { text: string; score: number }[] = [];
+
+  for (const pass of passes) {
+    const targetCanvas = pass.crop ? cropCanvas(canvas, pass.crop) : canvas;
+    const preparedCanvas = upscaleCanvas(targetCanvas, pass.upscale ?? 1);
+    const image = preprocessCanvasForOcr(preparedCanvas, pass.variant ?? "raw");
+    const chunk = await recognizeImageText(
+      image,
+      pass.languages ?? ["eng"],
+      {
+        pageSegMode: pass.pageSegMode ?? sparseTextOcrPageSegMode,
+      },
+    );
+
+    if (chunk) {
+      chunks.push({
+        text: chunk,
+        score: scoreOcrTextCandidate(chunk, context),
+      });
+    }
+  }
+
+  return mergeOcrTextBlocks(
+    chunks
+      .sort((first, second) => second.score - first.score)
+      .slice(0, Math.min(2, chunks.length))
+      .map((item) => item.text),
+  );
+};
+
 const renderPdfPageToCanvas = async (file: File, pageNumber: number) => {
   if (typeof document === "undefined") {
     throw new Error("OCR rendering is only available in the browser.");
@@ -500,7 +804,9 @@ const renderPdfPageToCanvas = async (file: File, pageNumber: number) => {
   const data = new Uint8Array(await file.arrayBuffer());
   const pdf = await getDocument({ data } as never).promise;
   const page = await pdf.getPage(pageNumber);
-  const viewport = page.getViewport({ scale: pdfOcrRenderScale });
+  const viewport = page.getViewport({
+    scale: pdfOcrRenderScale,
+  });
   const canvas = document.createElement("canvas");
   const context = canvas.getContext("2d");
 
@@ -520,28 +826,141 @@ const renderPdfPageToCanvas = async (file: File, pageNumber: number) => {
   return canvas;
 };
 
+const renderPdfPageToCanvasWithScale = async (
+  file: File,
+  pageNumber: number,
+  scale: number,
+) => {
+  if (typeof document === "undefined") {
+    throw new Error("OCR rendering is only available in the browser.");
+  }
+
+  const { getDocument } = await getPdfJs();
+  const data = new Uint8Array(await file.arrayBuffer());
+  const pdf = await getDocument({ data } as never).promise;
+  const page = await pdf.getPage(pageNumber);
+  const viewport = page.getViewport({ scale });
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+
+  if (!context) {
+    throw new Error("Canvas context is unavailable.");
+  }
+
+  canvas.width = Math.ceil(viewport.width);
+  canvas.height = Math.ceil(viewport.height);
+
+  await page.render({
+    canvas,
+    canvasContext: context,
+    viewport,
+  }).promise;
+
+  return canvas;
+};
+
+const cloneCanvas = (source: HTMLCanvasElement) => {
+  const canvas = document.createElement("canvas");
+  canvas.width = source.width;
+  canvas.height = source.height;
+  const context = canvas.getContext("2d");
+
+  if (!context) {
+    throw new Error("Canvas context is unavailable.");
+  }
+
+  context.drawImage(source, 0, 0);
+  return { canvas, context };
+};
+
+const applyAutocontrastToImageData = (imageData: ImageData) => {
+  const { data } = imageData;
+  let min = 255;
+  let max = 0;
+
+  for (let index = 0; index < data.length; index += 4) {
+    const luminance = Math.round(data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114);
+    if (luminance < min) {
+      min = luminance;
+    }
+    if (luminance > max) {
+      max = luminance;
+    }
+  }
+
+  const range = Math.max(1, max - min);
+  for (let index = 0; index < data.length; index += 4) {
+    const luminance = Math.round(data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114);
+    const stretched = Math.max(0, Math.min(255, Math.round(((luminance - min) * 255) / range)));
+    data[index] = stretched;
+    data[index + 1] = stretched;
+    data[index + 2] = stretched;
+  }
+
+  return imageData;
+};
+
+const preprocessCanvasForOcr = (
+  source: HTMLCanvasElement,
+  variant: CanvasOcrVariant,
+) => {
+  if (variant === "raw") {
+    return source.toDataURL("image/png");
+  }
+
+  const { canvas, context } = cloneCanvas(source);
+  const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+  const contrasted = applyAutocontrastToImageData(imageData);
+  const threshold =
+    variant === "threshold180" ? 180 : variant === "threshold160" ? 160 : null;
+
+  if (threshold !== null) {
+    for (let index = 0; index < contrasted.data.length; index += 4) {
+      const value = contrasted.data[index] > threshold ? 255 : 0;
+      contrasted.data[index] = value;
+      contrasted.data[index + 1] = value;
+      contrasted.data[index + 2] = value;
+    }
+  }
+
+  context.putImageData(contrasted, 0, 0);
+  return canvas.toDataURL("image/png");
+};
+
+const upscaleCanvas = (
+  source: HTMLCanvasElement,
+  multiplier: number,
+) => {
+  if (multiplier <= 1) {
+    return source;
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(source.width * multiplier));
+  canvas.height = Math.max(1, Math.round(source.height * multiplier));
+  const context = canvas.getContext("2d");
+
+  if (!context) {
+    throw new Error("Canvas context is unavailable.");
+  }
+
+  context.imageSmoothingEnabled = false;
+  context.drawImage(source, 0, 0, canvas.width, canvas.height);
+  return canvas;
+};
+
 const renderPdfPageToImage = async (file: File, pageNumber: number) => {
   const canvas = await renderPdfPageToCanvas(file, pageNumber);
   return canvas.toDataURL("image/png");
 };
 
-const cropCanvasToDataUrl = (
+const cropCanvas = (
   source: HTMLCanvasElement,
-  {
-    left,
-    top,
-    width,
-    height,
-  }: {
-    left: number;
-    top: number;
-    width: number;
-    height: number;
-  },
+  rect: CanvasCropRect,
 ) => {
   const canvas = document.createElement("canvas");
-  canvas.width = Math.max(1, Math.round(source.width * width));
-  canvas.height = Math.max(1, Math.round(source.height * height));
+  canvas.width = Math.max(1, Math.round(source.width * rect.width));
+  canvas.height = Math.max(1, Math.round(source.height * rect.height));
   const context = canvas.getContext("2d");
 
   if (!context) {
@@ -550,17 +969,17 @@ const cropCanvasToDataUrl = (
 
   context.drawImage(
     source,
-    Math.round(source.width * left),
-    Math.round(source.height * top),
-    Math.round(source.width * width),
-    Math.round(source.height * height),
+    Math.round(source.width * rect.left),
+    Math.round(source.height * rect.top),
+    Math.round(source.width * rect.width),
+    Math.round(source.height * rect.height),
     0,
     0,
     canvas.width,
     canvas.height,
   );
 
-  return canvas.toDataURL("image/png");
+  return canvas;
 };
 
 const extractImageTextWithOcr = async (
@@ -635,7 +1054,7 @@ const extractPdfTextWithOcr = async (
     const { getDocument } = await getPdfJs();
     const data = new Uint8Array(await file.arrayBuffer());
     const pdf = await getDocument({ data } as never).promise;
-    const pageLimit = Math.min(pdf.numPages, 3);
+    const pageLimit = getPdfScanPageLimit(pdf.numPages, context);
     const contextText = `${context.requirementLabel ?? ""} ${file.name}`;
     const prefersEnglishPrimary =
       context.requirementKey === "memorandumAndArticles" ||
@@ -643,40 +1062,192 @@ const extractPdfTextWithOcr = async (
       /章程|注册证书|memorandum|articles|association|incorporation|certificate/i.test(
         contextText,
       );
+    const defaultLanguages = prefersEnglishPrimary ? ["eng"] : ["eng", "chi_sim"];
 
     const ocrChunks: string[] = [];
     for (let index = 1; index <= pageLimit; index += 1) {
-      const canvas = await renderPdfPageToCanvas(file, index);
-      const image = canvas.toDataURL("image/png");
-      const chunk = await recognizeImageText(
-        image,
-        prefersEnglishPrimary ? ["eng"] : ["eng", "chi_sim"],
-        {
-          pageSegMode: prefersEnglishPrimary
-            ? defaultOcrPageSegMode
-            : sparseTextOcrPageSegMode,
-        },
+      const canvas = await renderPdfPageToCanvasWithScale(
+        file,
+        index,
+        isConstitutionContext(context) ? constitutionPdfOcrRenderScale : pdfOcrRenderScale,
       );
-      if (chunk) {
-        ocrChunks.push(chunk);
+      const pageText = await recognizeCanvasPasses(
+        canvas,
+        [
+          {
+            languages: defaultLanguages,
+            pageSegMode: prefersEnglishPrimary
+              ? index === 1
+                ? defaultOcrPageSegMode
+                : sparseTextOcrPageSegMode
+              : sparseTextOcrPageSegMode,
+            variant: "raw",
+          },
+          ...(isConstitutionContext(context)
+            ? [
+                {
+                  languages: ["eng"],
+                  pageSegMode: defaultOcrPageSegMode,
+                  variant: "autocontrast" as const,
+                },
+                {
+                  languages: ["eng"],
+                  pageSegMode: defaultOcrPageSegMode,
+                  variant: "threshold180" as const,
+                },
+              ]
+            : []),
+        ],
+        context,
+      );
+      if (pageText) {
+        ocrChunks.push(pageText);
       }
 
       if (index === 1 && isLegalDocumentContext(context)) {
-        const addressFocusChunk = await recognizeImageText(
-          cropCanvasToDataUrl(canvas, {
-            left: 0.18,
-            top: 0.72,
-            width: 0.64,
-            height: 0.2,
-          }),
-          ["eng"],
-          {
-            pageSegMode: sparseTextOcrPageSegMode,
-          },
+        const addressFocusChunk = await recognizeCanvasPasses(
+          canvas,
+          [
+            {
+              crop: {
+                left: 0.16,
+                top: 0.68,
+                width: 0.68,
+                height: 0.2,
+              },
+              languages: ["eng"],
+              pageSegMode: blockTextOcrPageSegMode,
+              variant: "autocontrast",
+            },
+            {
+              crop: {
+                left: 0.16,
+                top: 0.68,
+                width: 0.68,
+                height: 0.2,
+              },
+              languages: ["eng"],
+              pageSegMode: defaultOcrPageSegMode,
+              variant: "threshold180",
+            },
+          ],
+          context,
         );
 
         if (addressFocusChunk) {
           ocrChunks.push(addressFocusChunk);
+        }
+      }
+
+      if (index === 1 && isConstitutionContext(context)) {
+        const titleFocusChunk = await recognizeCanvasPasses(
+          canvas,
+          [
+            {
+              crop: {
+                left: 0.18,
+                top: 0.22,
+                width: 0.64,
+                height: 0.46,
+              },
+              languages: ["eng"],
+              pageSegMode: blockTextOcrPageSegMode,
+              variant: "autocontrast",
+            },
+            {
+              crop: {
+                left: 0.18,
+                top: 0.22,
+                width: 0.64,
+                height: 0.46,
+              },
+              languages: ["eng"],
+              pageSegMode: defaultOcrPageSegMode,
+              variant: "threshold180",
+            },
+          ],
+          context,
+        );
+        if (titleFocusChunk) {
+          ocrChunks.push(titleFocusChunk);
+        }
+
+        const agentAddressChunk = await recognizeCanvasPasses(
+          canvas,
+          [
+            {
+              crop: {
+                left: 0.27,
+                top: 0.72,
+                width: 0.46,
+                height: 0.15,
+              },
+              languages: ["eng"],
+              pageSegMode: blockTextOcrPageSegMode,
+              variant: "autocontrast",
+              upscale: 4,
+            },
+            {
+              crop: {
+                left: 0.27,
+                top: 0.72,
+                width: 0.46,
+                height: 0.15,
+              },
+              languages: ["eng"],
+              pageSegMode: defaultOcrPageSegMode,
+              variant: "threshold180",
+              upscale: 4,
+            },
+            {
+              crop: {
+                left: 0.27,
+                top: 0.72,
+                width: 0.46,
+                height: 0.15,
+              },
+              languages: ["eng"],
+              pageSegMode: blockTextOcrPageSegMode,
+              variant: "threshold160",
+              upscale: 4,
+            },
+          ],
+          context,
+        );
+        if (agentAddressChunk) {
+          ocrChunks.push(agentAddressChunk);
+        }
+
+        const incorporationDateChunk = await recognizeCanvasPasses(
+          canvas,
+          [
+            {
+              crop: {
+                left: 0.2,
+                top: 0.52,
+                width: 0.56,
+                height: 0.16,
+              },
+              languages: ["eng"],
+              pageSegMode: blockTextOcrPageSegMode,
+              variant: "autocontrast",
+            },
+            {
+              crop: {
+                left: 0.2,
+                top: 0.52,
+                width: 0.56,
+                height: 0.16,
+              },
+              languages: ["eng"],
+              pageSegMode: defaultOcrPageSegMode,
+              variant: "threshold180",
+            },
+          ],
+          context,
+        );
+        if (incorporationDateChunk) {
+          ocrChunks.push(incorporationDateChunk);
         }
       }
     }
@@ -815,6 +1386,7 @@ const extractJsonPatch = async (file: File) => {
         mappedKey,
       value: normalized,
       source: file.name,
+      strategy: "json",
     });
   }
 
@@ -995,6 +1567,7 @@ const extractKeyValueFindings = (
       label: hint.label,
       value: candidate,
       source,
+      strategy: "key-value",
     });
   }
 
@@ -1090,6 +1663,107 @@ const formatDateToIso = (year: number, month: number, day: number) => {
     .padStart(2, "0")}-${day.toString().padStart(2, "0")}`;
 };
 
+const normalizeYearToken = (value: string) => {
+  const digits = normalizeOcrDigitFragment(value).replace(/\D/g, "");
+  if (!digits) {
+    return NaN;
+  }
+
+  if (digits.length === 2) {
+    const parsed = Number(digits);
+    return parsed <= 30 ? 2000 + parsed : 1900 + parsed;
+  }
+
+  if (digits.length === 3) {
+    const parsed = Number(digits);
+    if (parsed >= 900) {
+      return 1900 + (parsed % 100);
+    }
+    return 2000 + (parsed % 100);
+  }
+
+  return Number(digits.slice(0, 4));
+};
+
+const monthNameMap: Record<string, number> = {
+  jan: 1,
+  january: 1,
+  feb: 2,
+  february: 2,
+  mar: 3,
+  march: 3,
+  apr: 4,
+  april: 4,
+  may: 5,
+  jun: 6,
+  june: 6,
+  jul: 7,
+  july: 7,
+  aug: 8,
+  august: 8,
+  sep: 9,
+  sept: 9,
+  september: 9,
+  oct: 10,
+  october: 10,
+  nov: 11,
+  november: 11,
+  dec: 12,
+  december: 12,
+};
+
+const levenshteinDistance = (first: string, second: string) => {
+  const rows = Array.from({ length: first.length + 1 }, () =>
+    Array.from({ length: second.length + 1 }, () => 0),
+  );
+
+  for (let index = 0; index <= first.length; index += 1) {
+    rows[index][0] = index;
+  }
+  for (let index = 0; index <= second.length; index += 1) {
+    rows[0][index] = index;
+  }
+
+  for (let row = 1; row <= first.length; row += 1) {
+    for (let column = 1; column <= second.length; column += 1) {
+      const cost = first[row - 1] === second[column - 1] ? 0 : 1;
+      rows[row][column] = Math.min(
+        rows[row - 1][column] + 1,
+        rows[row][column - 1] + 1,
+        rows[row - 1][column - 1] + cost,
+      );
+    }
+  }
+
+  return rows[first.length][second.length];
+};
+
+const normalizeMonthToken = (value: string) => {
+  const cleaned = value.toLowerCase().replace(/[^a-z]/g, "");
+  if (!cleaned) {
+    return 0;
+  }
+
+  const exact = monthNameMap[cleaned];
+  if (exact) {
+    return exact;
+  }
+
+  const closest = Object.entries(monthNameMap)
+    .map(([token, month]) => ({
+      month,
+      distance: levenshteinDistance(cleaned, token),
+      lengthGap: Math.abs(cleaned.length - token.length),
+    }))
+    .sort((first, second) =>
+      first.distance === second.distance
+        ? first.lengthGap - second.lengthGap
+        : first.distance - second.distance,
+    )[0];
+
+  return closest && closest.distance <= 2 ? closest.month : 0;
+};
+
 const normalizeDateCandidate = (value: string) => {
   const normalized = cleanMatchValue(value);
 
@@ -1102,53 +1776,25 @@ const normalizeDateCandidate = (value: string) => {
   if (match) {
     const day = Number(match[1]);
     const month = Number(match[2]);
-    const rawYear = Number(match[3]);
-    const year = rawYear < 100 ? 2000 + rawYear : rawYear;
+    const year = normalizeYearToken(match[3]);
     return formatDateToIso(year, month, day);
   }
 
-  const monthMap: Record<string, number> = {
-    jan: 1,
-    january: 1,
-    feb: 2,
-    february: 2,
-    mar: 3,
-    march: 3,
-    apr: 4,
-    april: 4,
-    may: 5,
-    jun: 6,
-    june: 6,
-    jul: 7,
-    july: 7,
-    aug: 8,
-    august: 8,
-    sep: 9,
-    sept: 9,
-    september: 9,
-    oct: 10,
-    october: 10,
-    nov: 11,
-    november: 11,
-    dec: 12,
-    december: 12,
-  };
-
   match = normalized.match(
-    /\b(\d{1,2})(?:st|nd|rd|th)?(?:\s+day\s+of|\s+of|\s+)([A-Za-z]+),?\s+(\d{4})\b/i,
+    /\b(\d{1,2})(?:st|nd|rd|th)?(?:\s+d[ao]y\s+of|\s+day\s+of|\s+of|\s+)([A-Za-z]+),?\s+(\d{2,4})\b/i,
   );
   if (match) {
-    const month = monthMap[match[2].toLowerCase()];
+    const month = normalizeMonthToken(match[2]);
     if (month) {
-      return formatDateToIso(Number(match[3]), month, Number(match[1]));
+      return formatDateToIso(normalizeYearToken(match[3]), month, Number(match[1]));
     }
   }
 
-  match = normalized.match(/\b([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b/i);
+  match = normalized.match(/\b([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{2,4})\b/i);
   if (match) {
-    const month = monthMap[match[1].toLowerCase()];
+    const month = normalizeMonthToken(match[1]);
     if (month) {
-      return formatDateToIso(Number(match[3]), month, Number(match[2]));
+      return formatDateToIso(normalizeYearToken(match[3]), month, Number(match[2]));
     }
   }
 
@@ -1163,6 +1809,10 @@ const normalizeFieldValue = (
 
   switch (field) {
     case "registeredAddress":
+      if (constitutionAddressSignalPattern.test(normalized) || registeredAgentLinePattern.test(normalized)) {
+        return normalizeConstitutionAddressCandidate(normalized);
+      }
+      return normalizeAddressCandidate(normalized);
     case "businessAddress":
       return normalizeAddressCandidate(normalized);
     case "businessRegistrationNo":
@@ -1171,6 +1821,14 @@ const normalizeFieldValue = (
       return normalizeRegistrationCandidate(normalized, { preferDigits: true });
     case "incorporationDate":
       return normalizeDateCandidate(normalized);
+    case "authorizedShareCount":
+    case "issuedShareCount":
+      return normalizeShareCountCandidate(normalized);
+    case "authorizedShareFaceValue":
+    case "issuedShareFaceValue":
+    case "authorizedShareCapital":
+    case "paidUpCapital":
+      return normalizeMoneyCandidate(normalized);
     default:
       return normalized;
   }
@@ -1198,6 +1856,16 @@ const validateFieldValue = (
       return isLikelyRegistrationValue(value, "incorporation");
     case "incorporationDate":
       return Boolean(normalizeDateCandidate(value));
+    case "authorizedShareCount":
+    case "issuedShareCount": {
+      const count = Number.parseInt(value.replace(/,/g, ""), 10);
+      return Number.isFinite(count) && count > 0;
+    }
+    case "authorizedShareFaceValue":
+    case "issuedShareFaceValue":
+    case "authorizedShareCapital":
+    case "paidUpCapital":
+      return value === "No par value" || Boolean(parseNormalizedMoneyCandidate(value));
     case "contactPhone":
       return /[+\d()\- ][\d()\- ]{6,30}/.test(value);
     case "email":
@@ -1210,6 +1878,7 @@ const validateFieldValue = (
 const getFieldLabel = (field: keyof CompanyAccountFormValues) =>
   requiredFieldLabels.find((entry) => entry.field === field)?.label ??
   prefillRules.find((entry) => entry.field === field)?.label ??
+  extractedFieldLabels[field] ??
   field;
 
 const sanitizeFinding = (finding: PrefillFinding): PrefillFinding | null => {
@@ -1223,6 +1892,182 @@ const sanitizeFinding = (finding: PrefillFinding): PrefillFinding | null => {
     label: getFieldLabel(finding.field),
     value: normalizedValue,
   };
+};
+
+const scoreConstitutionAddressCandidate = (value: string) => {
+  const normalized = normalizeConstitutionAddressCandidate(value);
+  let score = scoreAddressCandidate(normalized);
+
+  if (/sea meadow house/i.test(normalized)) {
+    score += 8;
+  }
+  if (/p\.?\s*o\.?\s*box\s*\d+/i.test(normalized)) {
+    score += 8;
+  } else if (/p\.?\s*o\.?\s*box/i.test(normalized)) {
+    score += 4;
+  }
+  if (/road town/i.test(normalized)) {
+    score += 6;
+  }
+  if (/tortola/i.test(normalized)) {
+    score += 6;
+  }
+  if (/british virgin islands|bvi/i.test(normalized)) {
+    score += 6;
+  }
+  if (normalized.split(",").length >= 4) {
+    score += 2;
+  }
+
+  return score;
+};
+
+const scoreCompanyNameCandidate = (value: string) => {
+  const normalized = cleanMatchValue(value);
+  if (!looksLikeCorporateName(normalized)) {
+    return -50;
+  }
+
+  let score = normalized.length;
+  if (/(limited|ltd\.?|corporation|company)/i.test(normalized)) {
+    score += 15;
+  }
+  if (ignoredCompanyLines.some((pattern) => pattern.test(normalized))) {
+    score -= 80;
+  }
+
+  return score;
+};
+
+const scoreDateCandidate = (value: string) => {
+  const normalized = normalizeDateCandidate(value);
+  if (!normalized) {
+    return -50;
+  }
+
+  return /^20\d{2}-\d{2}-\d{2}$/.test(normalized) ? 40 : 30;
+};
+
+const scoreShareValueCandidate = (
+  field: keyof CompanyAccountFormValues,
+  value: string,
+) => {
+  const normalized = normalizeFieldValue(field, value);
+  if (!validateFieldValue(field, normalized)) {
+    return -50;
+  }
+
+  if (field === "authorizedShareCount" || field === "issuedShareCount") {
+    const count = Number.parseInt(normalized.replace(/,/g, ""), 10);
+    return Number.isFinite(count) ? Math.min(40, String(count).length * 5) : -50;
+  }
+
+  if (normalized === "No par value") {
+    return 25;
+  }
+
+  const money = parseNormalizedMoneyCandidate(normalized);
+  return money ? Math.min(40, String(Math.trunc(money.amount)).length * 4 + 8) : -50;
+};
+
+const scoreFindingRequirementBonus = (finding: PrefillFinding) => {
+  switch (finding.field) {
+    case "companyNameEnglish":
+      return finding.requirementKey === "memorandumAndArticles" ||
+        finding.requirementKey === "certificateOfIncorporation" ||
+        finding.requirementKey === "businessRegistration" ||
+        finding.requirementKey === "incumbencyOrGoodStanding" ||
+        finding.requirementKey === "annualReturnAndChanges"
+        ? 18
+        : 0;
+    case "registeredAddress":
+      return finding.requirementKey === "memorandumAndArticles"
+        ? 26
+        : finding.requirementKey === "incumbencyOrGoodStanding" ||
+            finding.requirementKey === "annualReturnAndChanges" ||
+            finding.requirementKey === "businessRegistration"
+          ? 16
+          : 0;
+    case "businessAddress":
+      return finding.requirementKey === "businessRegistration" ? 18 : 0;
+    case "incorporationDate":
+    case "incorporationNo":
+      return finding.requirementKey === "memorandumAndArticles" ||
+        finding.requirementKey === "certificateOfIncorporation" ||
+        finding.requirementKey === "incumbencyOrGoodStanding"
+        ? 18
+        : 0;
+    case "businessRegistrationNo":
+      return finding.requirementKey === "businessRegistration" ? 18 : 0;
+    case "authorizedShareCapital":
+    case "authorizedShareCount":
+    case "authorizedShareFaceValue":
+      return finding.requirementKey === "memorandumAndArticles" ? 24 : 0;
+    default:
+      return 0;
+  }
+};
+
+const scorePrefillFinding = (finding: PrefillFinding) => {
+  const normalizedValue = normalizeFieldValue(finding.field, finding.value);
+  if (!validateFieldValue(finding.field, normalizedValue)) {
+    return -1000;
+  }
+
+  let score = scoreFindingRequirementBonus(finding);
+
+  switch (finding.field) {
+    case "companyNameEnglish":
+      score += scoreCompanyNameCandidate(normalizedValue);
+      break;
+    case "registeredAddress":
+      score += scoreAddressCandidate(normalizedValue) * 6;
+      if (
+        finding.requirementKey === "memorandumAndArticles" ||
+        constitutionAddressSignalPattern.test(normalizedValue)
+      ) {
+        score += scoreConstitutionAddressCandidate(normalizedValue) * 4;
+      }
+      break;
+    case "businessAddress":
+      score += scoreAddressCandidate(normalizedValue) * 6;
+      break;
+    case "incorporationDate":
+      score += scoreDateCandidate(normalizedValue);
+      break;
+    case "businessRegistrationNo":
+      score += scoreRegistrationToken(normalizedValue, "businessRegistration") * 8;
+      break;
+    case "incorporationNo":
+      score += scoreRegistrationToken(normalizedValue, "incorporation") * 8;
+      break;
+    case "authorizedShareCapital":
+    case "authorizedShareCount":
+    case "authorizedShareFaceValue":
+      score += scoreShareValueCandidate(finding.field, normalizedValue);
+      break;
+    default:
+      score += normalizedValue.length;
+      break;
+  }
+
+  if (finding.strategy === "constitution") {
+    score += 12;
+  } else if (finding.strategy === "constitution-share") {
+    score += 10;
+  } else if (finding.strategy === "constitution-derived") {
+    score += 8;
+  } else if (finding.strategy === "title-block") {
+    score += 8;
+  } else if (finding.strategy === "key-value") {
+    score += 6;
+  } else if (finding.strategy === "contextual") {
+    score -= 2;
+  } else if (finding.strategy === "regex") {
+    score -= 4;
+  }
+
+  return score;
 };
 
 const scoreAddressCandidate = (value: string) => {
@@ -1462,6 +2307,208 @@ const extractBestRegistrationCandidate = (
   return candidates[0]?.value ?? "";
 };
 
+const extractConstitutionRegisteredAddress = (text: string) => {
+  const lines = normalizeExtractionText(text)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const candidates: { value: string; score: number }[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (!registeredAgentLinePattern.test(line)) {
+      continue;
+    }
+
+    const parts = [line];
+    for (let offset = 1; offset <= 4; offset += 1) {
+      const candidate = lines[index + offset];
+      if (!candidate) {
+        break;
+      }
+      if (legalDocumentTitlePattern.test(candidate) || /^incorporated\b/i.test(candidate)) {
+        continue;
+      }
+      if (genericFieldLabelPattern.test(candidate)) {
+        break;
+      }
+
+      parts.push(candidate);
+      if (/british virgin islands|bvi/i.test(candidate)) {
+        break;
+      }
+    }
+
+    const candidate = normalizeConstitutionAddressCandidate(parts.join(", "));
+    const score = scoreConstitutionAddressCandidate(candidate);
+    if (score >= 8) {
+      candidates.push({ value: candidate, score: score + 8 });
+    }
+  }
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (!constitutionAddressSignalPattern.test(line)) {
+      continue;
+    }
+
+    const start = Math.max(0, index - 2);
+    const window = normalizeConstitutionAddressCandidate(
+      lines.slice(start, Math.min(lines.length, index + 4)).join(", "),
+    );
+    const score = scoreConstitutionAddressCandidate(window);
+    if (score >= 8) {
+      candidates.push({ value: window, score });
+    }
+  }
+
+  for (const window of buildLineWindows(lines, 5)) {
+    if (!constitutionAddressSignalPattern.test(window)) {
+      continue;
+    }
+
+    const candidate = normalizeConstitutionAddressCandidate(window);
+    const score = scoreConstitutionAddressCandidate(candidate);
+    if (score >= 8) {
+      candidates.push({ value: candidate, score });
+    }
+  }
+
+  candidates.sort((first, second) => second.score - first.score);
+  return candidates[0]?.value ?? "";
+};
+
+const extractConstitutionShareFindings = (
+  text: string,
+  source: string,
+) => {
+  const findings: PrefillFinding[] = [];
+  const lines = normalizeExtractionText(text)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const pushFinding = (field: keyof CompanyAccountFormValues, value: string) => {
+    const normalized = normalizeFieldValue(field, value);
+    if (!validateFieldValue(field, normalized)) {
+      return;
+    }
+
+    findings.push({
+      field,
+      label: getFieldLabel(field),
+      value: normalized,
+      source,
+      strategy: "constitution-share",
+    });
+  };
+
+  const capitalLine = lines.find(
+    (line) =>
+      shareClauseSignalPattern.test(line) &&
+      /(maximum|up to|aggregate|capital)/i.test(line) &&
+      /\$|\d/.test(line),
+  );
+  const countLine = lines.find(
+    (line) =>
+      shareClauseSignalPattern.test(line) &&
+      /(shares?|number of shares|divided into)/i.test(line) &&
+      /\d/.test(line),
+  );
+  const faceValueLine = lines.find(
+    (line) =>
+      shareClauseSignalPattern.test(line) &&
+      /(par value|face value|of us\$|of \$|each)/i.test(line) &&
+      /\$|\d|no par value/i.test(line),
+  );
+
+  const countMatch = countLine?.match(/(\d[\d,]{2,})\s+shares?/i);
+  if (countMatch?.[1]) {
+    pushFinding("authorizedShareCount", countMatch[1]);
+  }
+
+  const faceValueMatch =
+    faceValueLine?.match(
+      /(US\$|USD|HK\$|HKD|RMB|CNY|CNH|\$)\s*\d[\d,]*(?:\.\d{1,2})?|\bno\s+par\s+value\b/i,
+    ) ??
+    capitalLine?.match(
+      /(US\$|USD|HK\$|HKD|RMB|CNY|CNH|\$)\s*\d[\d,]*(?:\.\d{1,2})?|\bno\s+par\s+value\b/i,
+    );
+  if (faceValueMatch?.[0]) {
+    pushFinding("authorizedShareFaceValue", faceValueMatch[0]);
+  }
+
+  const capitalMatch =
+    capitalLine?.match(
+      /(US\$|USD|HK\$|HKD|RMB|CNY|CNH|\$)\s*\d[\d,]*(?:\.\d{1,2})?(?!.*(each|per share))/i,
+    ) ?? null;
+  if (capitalMatch?.[0]) {
+    pushFinding("authorizedShareCapital", capitalMatch[0]);
+  }
+
+  const deduped = dedupeFindings(findings);
+  const countValue = deduped.find((item) => item.field === "authorizedShareCount")?.value ?? "";
+  const faceValue = deduped.find((item) => item.field === "authorizedShareFaceValue")?.value ?? "";
+  const hasCapital = deduped.some((item) => item.field === "authorizedShareCapital");
+  if (!hasCapital && countValue && faceValue) {
+    const derivedCapital = deriveCapitalFromCountAndFaceValue(countValue, faceValue);
+    if (derivedCapital) {
+      deduped.push({
+        field: "authorizedShareCapital",
+        label: getFieldLabel("authorizedShareCapital"),
+        value: derivedCapital,
+        source,
+        strategy: "constitution-derived",
+      });
+    }
+  }
+
+  return {
+    findings: dedupeFindings(deduped),
+  };
+};
+
+const extractConstitutionFindings = (
+  text: string,
+  source: string,
+  context: ExtractionContext,
+) => {
+  if (!isConstitutionContext(context)) {
+    return { findings: [] as PrefillFinding[] };
+  }
+
+  const findings: PrefillFinding[] = [];
+  const pushFinding = (field: keyof CompanyAccountFormValues, value: string) => {
+    if (!value) {
+      return;
+    }
+    findings.push({
+      field,
+      label: getFieldLabel(field),
+      value,
+      source,
+      strategy: "constitution",
+    });
+  };
+
+  const registeredAddress = extractConstitutionRegisteredAddress(text);
+  if (registeredAddress) {
+    pushFinding("registeredAddress", registeredAddress);
+  }
+
+  const titleCompanyMatch = text.match(
+    /(?:memorandum\s+and\s+articles\s+of\s+association|articles\s+of\s+association)\s+of\s+([A-Z][A-Za-z0-9&.,()'\/ -]{3,160}?(?:Limited|Ltd\.?|Corporation|Company))/i,
+  );
+  if (titleCompanyMatch?.[1]) {
+    pushFinding("companyNameEnglish", titleCompanyMatch[1]);
+  }
+
+  return {
+    findings: [...findings, ...extractConstitutionShareFindings(text, source).findings],
+  };
+};
+
 const extractContextualFindings = (
   text: string,
   source: string,
@@ -1480,6 +2527,7 @@ const extractContextualFindings = (
       label: getFieldLabel(field),
       value,
       source,
+      strategy: "contextual",
     });
   };
 
@@ -1529,16 +2577,149 @@ const sanitizeFindings = (
 
 const buildPatchFromFindings = (findings: PrefillFinding[]) => {
   const patch: Partial<CompanyAccountFormValues> = {};
+  const bestFindingByField = getBestFindingByField(findings);
 
-  for (const finding of findings) {
-    if (patch[finding.field]) {
-      continue;
-    }
-
-    patch[finding.field] = finding.value as never;
+  for (const [field, { finding }] of bestFindingByField.entries()) {
+    patch[field] = finding.value as never;
   }
 
   return patch;
+};
+
+const reconcilePatchIntoValues = (
+  current: CompanyAccountFormValues,
+  previousPatch: Partial<CompanyAccountFormValues>,
+  nextPatch: Partial<CompanyAccountFormValues>,
+) => {
+  const next = structuredClone(current);
+  const keys = new Set<keyof CompanyAccountFormValues>([
+    ...(Object.keys(previousPatch) as (keyof CompanyAccountFormValues)[]),
+    ...(Object.keys(nextPatch) as (keyof CompanyAccountFormValues)[]),
+  ]);
+
+  for (const key of keys) {
+    const currentValue = next[key];
+    const previousValue = previousPatch[key];
+    const replacementValue = nextPatch[key];
+
+    if (typeof currentValue === "string") {
+      const previousString = typeof previousValue === "string" ? previousValue : "";
+      const replacementString = typeof replacementValue === "string" ? replacementValue : "";
+
+      if (currentValue && previousString && currentValue !== previousString) {
+        continue;
+      }
+
+      next[key] = replacementString as never;
+      continue;
+    }
+
+    if (Array.isArray(currentValue)) {
+      const previousArray = Array.isArray(previousValue) ? previousValue : [];
+      const replacementArray = Array.isArray(replacementValue) ? replacementValue : [];
+      const followsPreviousArray =
+        currentValue.length === 0 ||
+        JSON.stringify(currentValue) === JSON.stringify(previousArray);
+
+      if (followsPreviousArray && replacementArray.length > 0) {
+        next[key] = replacementArray as never;
+      }
+    }
+  }
+
+  return next;
+};
+
+const getBestFindingByField = (findings: PrefillFinding[]) => {
+  const bestFindingByField = new Map<
+    keyof CompanyAccountFormValues,
+    { finding: PrefillFinding; score: number; index: number }
+  >();
+
+  findings.forEach((finding, index) => {
+    const score = scorePrefillFinding(finding);
+    const current = bestFindingByField.get(finding.field);
+    if (
+      !current ||
+      score > current.score ||
+      (score === current.score && index < current.index)
+    ) {
+      bestFindingByField.set(finding.field, {
+        finding,
+        score,
+        index,
+      });
+    }
+  });
+
+  return bestFindingByField;
+};
+
+export const applyPrefillFindingsToValues = (
+  current: CompanyAccountFormValues,
+  previousFindings: PrefillFinding[],
+  nextFindings: PrefillFinding[],
+) =>
+  reconcilePatchIntoValues(
+    current,
+    buildPatchFromFindings(previousFindings),
+    buildPatchFromFindings(nextFindings),
+  );
+
+export const buildPrefillFieldDecisions = (
+  findings: PrefillFinding[],
+): PrefillFieldDecision[] => {
+  const bestFindingByField = getBestFindingByField(findings);
+  const findingsByField = new Map<keyof CompanyAccountFormValues, PrefillFinding[]>();
+
+  for (const finding of findings) {
+    const items = findingsByField.get(finding.field) ?? [];
+    items.push(finding);
+    findingsByField.set(finding.field, items);
+  }
+
+  const decisions: PrefillFieldDecision[] = [];
+
+  for (const [field, fieldFindings] of findingsByField.entries()) {
+      const selected = bestFindingByField.get(field);
+      if (!selected) {
+        continue;
+      }
+
+      const candidates: PrefillFieldDecisionCandidate[] = fieldFindings
+        .map((finding) => {
+          const score = scorePrefillFinding(finding);
+          return {
+            field: finding.field,
+            label: finding.label,
+            value: finding.value,
+            source: finding.source,
+            requirementKey: finding.requirementKey,
+            requirementLabel: finding.requirementLabel,
+            strategy: finding.strategy,
+            score,
+            selected: selected.finding === finding,
+          };
+        })
+        .sort((first, second) =>
+          first.score === second.score
+            ? Number(second.selected) - Number(first.selected)
+            : second.score - first.score,
+        );
+
+      decisions.push({
+        field,
+        label: selected.finding.label,
+        selectedValue: selected.finding.value,
+        selectedSource: selected.finding.source,
+        selectedRequirementLabel: selected.finding.requirementLabel,
+        selectedStrategy: selected.finding.strategy,
+        selectedScore: selected.score,
+        candidates,
+      });
+  }
+
+  return decisions.sort((first, second) => second.selectedScore - first.selectedScore);
 };
 
 const extractTitleBlockFindings = (
@@ -1571,6 +2752,7 @@ const extractTitleBlockFindings = (
       label,
       value: normalized,
       source,
+      strategy: "title-block",
     });
   };
 
@@ -1640,6 +2822,7 @@ const extractRegexFindings = (
       label: rule.label,
       value: matchValue,
       source,
+      strategy: "regex",
     });
   }
 
@@ -1711,6 +2894,9 @@ export const extractDocumentDataWithContext = async (
   const titleBlockResult = extractionText
     ? extractTitleBlockFindings(extractionText, file.name)
     : { findings: [] as PrefillFinding[], patch: {} as Partial<CompanyAccountFormValues> };
+  const constitutionResult = extractionText
+    ? extractConstitutionFindings(extractionText, file.name, context)
+    : { findings: [] as PrefillFinding[] };
   const keyValueResult = extractionText
     ? extractKeyValueFindings(extractionText, file.name)
     : { findings: [] as PrefillFinding[], patch: {} as Partial<CompanyAccountFormValues> };
@@ -1723,15 +2909,21 @@ export const extractDocumentDataWithContext = async (
       ...payload.findings,
       ...contextualResult.findings,
       ...titleBlockResult.findings,
+      ...constitutionResult.findings,
       ...keyValueResult.findings,
       ...regexResult.findings,
     ],
     context,
   );
-  const patch = buildPatchFromFindings(findings);
+  const contextualizedFindings = findings.map((finding) => ({
+    ...finding,
+    requirementKey,
+    requirementLabel,
+  }));
+  const patch = buildPatchFromFindings(contextualizedFindings);
   const parseNote =
-    findings.length > 0
-      ? `${payload.parseNote} 已命中 ${findings.length} 项字段。`
+    contextualizedFindings.length > 0
+      ? `${payload.parseNote} 已命中 ${contextualizedFindings.length} 项字段。`
       : payload.extractable
         ? `${payload.parseNote} 当前未命中字段，请检查下方 OCR 原文。`
         : payload.parseNote;
@@ -1748,14 +2940,10 @@ export const extractDocumentDataWithContext = async (
       extractable: payload.extractable,
       extractedTextSample: displayText.slice(0, 220),
       extractionMethod: payload.extractionMethod,
-      matchedFieldCount: findings.length,
+      matchedFieldCount: contextualizedFindings.length,
       parseNote,
     },
-    findings: findings.map((finding) => ({
-      ...finding,
-      requirementKey,
-      requirementLabel,
-    })),
+    findings: contextualizedFindings,
     patch,
   };
 };

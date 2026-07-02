@@ -5,7 +5,6 @@ import {
   AlertCircle,
   ArrowRight,
   BadgeCheck,
-  Building2,
   CheckCircle2,
   ChevronRight,
   ClipboardCheck,
@@ -58,6 +57,7 @@ import {
   type FundingSourceKey,
   type InvestmentObjectiveKey,
   type MaterialApplicability,
+  type PrefillFieldDecision,
   type MaterialRequirement,
   type MaterialRequirementKey,
   type PrefillFinding,
@@ -74,6 +74,8 @@ import {
 } from "@/lib/submission-client";
 import type { SubmissionRecord } from "@/lib/submission-payload";
 import {
+  applyPrefillFindingsToValues,
+  buildPrefillFieldDecisions,
   countCompletedExperiences,
   createInitialFormValues,
   deriveCompanyIncorporationRegion,
@@ -86,7 +88,6 @@ import {
   getMissingItems,
   getRequiredUploadMaterialRequirements,
   getStepValidationMessage,
-  mergePatchIntoValues,
   stepIndex,
   summarizeSelections,
   todayString,
@@ -136,6 +137,15 @@ const textareaClassName =
 const panelClassName =
   "rounded-lg border border-white/70 bg-white/88 shadow-[0_24px_60px_-40px_rgba(15,23,42,0.38)] backdrop-blur";
 
+type UploadProcessingState = {
+  requirementKey: MaterialRequirementKey;
+  requirementLabel: string;
+  currentIndex: number;
+  total: number;
+  fileName: string;
+  phase: "extracting" | "saving";
+};
+
 const autosaveDelayMs = 900;
 const uploadAccept =
   ".pdf,.txt,.csv,.md,.markdown,.json,.jpg,.jpeg,.png,.webp,.heic,.heif,image/*";
@@ -146,6 +156,29 @@ const extractionMethodLabels: Record<string, string> = {
   "pdf-ocr": "PDF OCR",
   "image-ocr": "图片 OCR",
 };
+const findingStrategyLabels: Record<string, string> = {
+  constitution: "章程专用",
+  "constitution-share": "章程股本",
+  "constitution-derived": "推导股本",
+  contextual: "上下文",
+  "key-value": "键值对",
+  "title-block": "标题区",
+  regex: "正则",
+  json: "结构化",
+};
+
+const priorityPrefillFields: {
+  field: keyof CompanyAccountFormValues;
+  label: string;
+  emptyHint: string;
+}[] = [
+  { field: "companyNameEnglish", label: "公司英文名称", emptyHint: "等待章程/注册证书识别" },
+  { field: "registeredAddress", label: "注册地址", emptyHint: "等待章程地址校准" },
+  { field: "incorporationDate", label: "注册日期", emptyHint: "等待注册资料识别" },
+  { field: "incorporationNo", label: "注册编号", emptyHint: "等待注册资料识别" },
+  { field: "authorizedShareCapital", label: "法定股本", emptyHint: "等待章程股本条款识别" },
+  { field: "authorizedShareCount", label: "法定股份", emptyHint: "等待章程股本条款识别" },
+];
 
 const applicabilityMeta: Record<
   MaterialApplicability,
@@ -237,6 +270,223 @@ function SectionHeading({
       </span>
       <h2 className="text-xl font-semibold text-slate-950 sm:text-2xl">{title}</h2>
       <p className="max-w-3xl text-sm leading-7 text-slate-600 sm:text-[15px]">{body}</p>
+    </div>
+  );
+}
+
+function PrefillDecisionCard({
+  decision,
+}: {
+  decision: PrefillFieldDecision;
+}) {
+  return (
+    <div className="rounded-xl border border-slate-200 bg-slate-50/80 px-4 py-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <h4 className="text-sm font-semibold text-slate-900">{decision.label}</h4>
+            <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
+              分数 {decision.selectedScore}
+            </span>
+            {decision.selectedStrategy ? (
+              <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-600">
+                {findingStrategyLabels[decision.selectedStrategy] ?? decision.selectedStrategy}
+              </span>
+            ) : null}
+          </div>
+          <p className="mt-2 break-words text-sm font-medium text-slate-950">
+            {decision.selectedValue}
+          </p>
+          <p className="mt-1 text-xs text-slate-500">
+            来源：{decision.selectedRequirementLabel ?? decision.selectedSource}
+          </p>
+        </div>
+        <span className="rounded-full bg-white px-2.5 py-1 text-[11px] font-medium text-slate-500 ring-1 ring-slate-200">
+          {decision.candidates.length} 个候选
+        </span>
+      </div>
+      <div className="mt-3 grid gap-2">
+        {decision.candidates.map((candidate, index) => (
+          <div
+            key={`${candidate.field}-${candidate.source}-${candidate.value}-${index}`}
+            className={`rounded-lg border px-3 py-3 ${
+              candidate.selected
+                ? "border-emerald-300 bg-emerald-50"
+                : "border-slate-200 bg-white"
+            }`}
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span
+                  className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${
+                    candidate.selected
+                      ? "bg-emerald-600 text-white"
+                      : "bg-slate-100 text-slate-600"
+                  }`}
+                >
+                  {candidate.selected ? "已选中" : "候选"}
+                </span>
+                <span className="text-xs font-medium text-slate-700">
+                  分数 {candidate.score}
+                </span>
+                {candidate.strategy ? (
+                  <span className="text-[11px] text-slate-500">
+                    {findingStrategyLabels[candidate.strategy] ?? candidate.strategy}
+                  </span>
+                ) : null}
+              </div>
+              <span className="text-[11px] text-slate-500">
+                {candidate.requirementLabel ?? candidate.source}
+              </span>
+            </div>
+            <p className="mt-2 break-words text-sm text-slate-800">{candidate.value}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function RegisteredAddressCalibrationCard({
+  decision,
+  currentValue,
+}: {
+  decision?: PrefillFieldDecision;
+  currentValue: string;
+}) {
+  const currentMatchesSelected = Boolean(
+    decision && currentValue && currentValue === decision.selectedValue,
+  );
+  const selectedFromConstitution = Boolean(
+    decision?.selectedStrategy?.startsWith("constitution") ||
+      /章程|memorandum|articles/i.test(
+        `${decision?.selectedRequirementLabel ?? ""} ${decision?.selectedSource ?? ""}`,
+      ),
+  );
+  const statusText = !decision
+    ? "未识别"
+    : currentMatchesSelected
+      ? "已回填"
+      : currentValue
+        ? "人工已调整"
+        : "待回填";
+
+  return (
+    <div className="rounded-2xl border border-amber-200 bg-amber-50/70 px-5 py-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <ScanSearch className="h-4 w-4 text-amber-700" />
+            <h3 className="text-sm font-semibold text-slate-950">注册地址校准</h3>
+          </div>
+          <p className="mt-1 text-xs leading-5 text-amber-800/75">
+            重点检查章程里的注册代理地址。BVI 章程应优先保留完整地址行，不取标题或公司名。
+          </p>
+        </div>
+        <span className="rounded-full bg-white px-2.5 py-1 text-[11px] font-semibold text-amber-800 ring-1 ring-amber-200">
+          {statusText}
+        </span>
+      </div>
+
+      <div className="mt-4 grid gap-3">
+        <div className="rounded-xl bg-white px-4 py-4 ring-1 ring-amber-100">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-xs font-semibold text-slate-500">表单当前注册地址</p>
+            {decision ? (
+              <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600">
+                选中分数 {decision.selectedScore}
+              </span>
+            ) : null}
+          </div>
+          <p
+            className={`mt-2 break-words text-sm leading-6 ${
+              currentValue ? "font-medium text-slate-950" : "text-slate-400"
+            }`}
+          >
+            {currentValue || "尚未从资料中取得注册地址"}
+          </p>
+          {decision && !currentMatchesSelected ? (
+            <div className="mt-3 rounded-lg bg-amber-50 px-3 py-2">
+              <p className="text-[11px] font-semibold text-amber-800">
+                系统候选值和当前表单值不同
+              </p>
+              <p className="mt-1 break-words text-xs leading-5 text-amber-900">
+                {decision.selectedValue}
+              </p>
+            </div>
+          ) : null}
+        </div>
+
+        {decision ? (
+          <div className="rounded-xl bg-white px-4 py-4 ring-1 ring-amber-100">
+            <div className="flex flex-wrap items-center gap-2">
+              <span
+                className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${
+                  selectedFromConstitution
+                    ? "bg-emerald-100 text-emerald-700"
+                    : "bg-slate-100 text-slate-600"
+                }`}
+              >
+                {selectedFromConstitution ? "章程候选已优先" : "非章程来源"}
+              </span>
+              {decision.selectedStrategy ? (
+                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600">
+                  {findingStrategyLabels[decision.selectedStrategy] ??
+                    decision.selectedStrategy}
+                </span>
+              ) : null}
+              <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600">
+                {decision.candidates.length} 个候选
+              </span>
+            </div>
+
+            <div className="mt-3 grid gap-2">
+              {decision.candidates.map((candidate, index) => (
+                <div
+                  key={`${candidate.source}-${candidate.value}-${index}`}
+                  className={`rounded-lg border px-3 py-3 ${
+                    candidate.selected
+                      ? "border-emerald-300 bg-emerald-50"
+                      : "border-slate-200 bg-white"
+                  }`}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${
+                          candidate.selected
+                            ? "bg-emerald-600 text-white"
+                            : "bg-slate-100 text-slate-600"
+                        }`}
+                      >
+                        {candidate.selected ? "最终采用" : "候选"}
+                      </span>
+                      <span className="text-[11px] font-medium text-slate-600">
+                        分数 {candidate.score}
+                      </span>
+                      {candidate.strategy ? (
+                        <span className="text-[11px] text-slate-500">
+                          {findingStrategyLabels[candidate.strategy] ?? candidate.strategy}
+                        </span>
+                      ) : null}
+                    </div>
+                    <span className="text-[11px] text-slate-500">
+                      {candidate.requirementLabel ?? candidate.source}
+                    </span>
+                  </div>
+                  <p className="mt-2 break-words text-xs leading-5 text-slate-700">
+                    {candidate.value}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="rounded-xl border border-dashed border-amber-300 bg-white/70 px-4 py-5 text-sm leading-6 text-amber-800">
+            还没有注册地址候选。请优先上传公司章程、注册证书或 Good Standing / Incumbency 文件。
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -369,15 +619,19 @@ function StepRail({
 function MaterialRequirementCell({
   requirement,
   documents,
+  findings,
   generatedReady,
   uploading,
+  processing,
   onUpload,
   onClear,
 }: {
   requirement: MaterialRequirement;
   documents: UploadedDocument[];
+  findings: PrefillFinding[];
   generatedReady: boolean;
   uploading: boolean;
+  processing: UploadProcessingState | null;
   onUpload: (event: ChangeEvent<HTMLInputElement>) => void;
   onClear: () => void;
 }) {
@@ -387,69 +641,135 @@ function MaterialRequirementCell({
   const hasDocuments = documents.length > 0;
   const showComplete = isGenerated ? generatedReady : hasDocuments;
   const extractableCount = documents.filter((document) => document.extractable).length;
+  const matchedFieldNames = Array.from(new Set(findings.map((finding) => finding.label)));
+  const latestDocument = documents.at(-1);
+  const isProcessingThisRequirement = processing?.requirementKey === requirement.key;
+  const statusLabel = isGenerated
+    ? generatedReady
+      ? "已入最终包"
+      : "系统生成"
+    : isProcessingThisRequirement
+      ? processing.phase === "saving"
+        ? "正在入库"
+        : "正在读取"
+      : hasDocuments
+        ? findings.length > 0
+          ? "已识别"
+          : extractableCount > 0
+            ? "已解析"
+            : "已归档"
+        : "待上传";
+  const statusClassName = isGenerated
+    ? generatedReady
+      ? "bg-emerald-50 text-emerald-700 ring-emerald-200"
+      : "bg-amber-50 text-amber-700 ring-amber-200"
+    : isProcessingThisRequirement
+      ? "bg-amber-50 text-amber-700 ring-amber-200"
+      : hasDocuments
+        ? findings.length > 0
+          ? "bg-emerald-50 text-emerald-700 ring-emerald-200"
+          : "bg-sky-50 text-sky-700 ring-sky-200"
+        : "bg-slate-100 text-slate-600 ring-slate-200";
 
   return (
-    <div className="h-full bg-white px-4 py-4 lg:px-5">
-      <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+    <div className="h-full bg-white px-4 py-4 transition hover:bg-slate-50/70 lg:px-5">
+      <div className="flex h-full flex-col gap-4">
         <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-start gap-2">
+          <div className="flex flex-wrap items-start justify-between gap-2">
             <p className="text-[15px] font-medium leading-7 text-slate-900">
               {requirement.label}
             </p>
-            <span
-              className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-medium ${meta.className}`}
-            >
-              {meta.label}
-            </span>
+            <div className="flex shrink-0 flex-wrap gap-2">
+              <span
+                className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-medium ${meta.className}`}
+              >
+                {meta.label}
+              </span>
+              <span
+                className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ${statusClassName}`}
+              >
+                {statusLabel}
+              </span>
+            </div>
           </div>
           {requirement.note ? (
             <p className="mt-1 text-xs leading-5 text-slate-500">{requirement.note}</p>
           ) : null}
 
           {isGenerated ? (
-            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-              <span
-                className={`inline-flex rounded-full px-2 py-0.5 font-medium ${
-                  generatedReady
-                    ? "bg-emerald-50 text-emerald-700"
-                    : "bg-amber-50 text-amber-700"
-                }`}
-              >
-                {generatedReady ? "签署版已入包" : "第4步生成"}
-              </span>
-              <span>系统自动生成，不需要首步上传。</span>
+            <div className="mt-3 rounded-xl border border-dashed border-slate-200 bg-slate-50 px-3 py-3 text-xs leading-5 text-slate-500">
+              系统自动生成，不需要首步上传。第 4 步生成签署版后会自动入包。
+            </div>
+          ) : isProcessingThisRequirement ? (
+            <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-3">
+              <div className="flex items-center gap-2 text-xs font-semibold text-amber-800">
+                <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                {processing.phase === "saving" ? "正在写入 Supabase" : "正在自动读取"}
+              </div>
+              <p className="mt-1 truncate text-xs text-amber-700">
+                {processing.currentIndex}/{processing.total} · {processing.fileName}
+              </p>
             </div>
           ) : hasDocuments ? (
-            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-              <span className="inline-flex rounded-full bg-emerald-50 px-2 py-0.5 font-medium text-emerald-700">
-                已上传 {documents.length} 份
-              </span>
-              {extractableCount > 0 ? (
-                <span className="inline-flex rounded-full bg-sky-50 px-2 py-0.5 font-medium text-sky-700">
-                  {extractableCount} 份可预填
+            <div className="mt-3 grid gap-2">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                <span className="inline-flex rounded-full bg-emerald-50 px-2 py-0.5 font-medium text-emerald-700">
+                  已上传 {documents.length} 份
                 </span>
-              ) : null}
-              {documents.slice(0, 2).map((document) => (
-                <span
-                  key={document.id}
-                  className="max-w-[260px] truncate rounded-full bg-slate-100 px-2 py-0.5 text-slate-700"
-                  title={`${document.name} · ${formatBytes(document.size)}`}
-                >
-                  {document.name}
+                {latestDocument?.extractionMethod ? (
+                  <span className="inline-flex rounded-full bg-white px-2 py-0.5 font-medium text-slate-600 ring-1 ring-slate-200">
+                    {extractionMethodLabels[latestDocument.extractionMethod] ??
+                      latestDocument.extractionMethod}
+                  </span>
+                ) : null}
+                <span className="inline-flex rounded-full bg-slate-100 px-2 py-0.5 font-medium text-slate-700">
+                  命中 {findings.length} 项
                 </span>
-              ))}
-              {documents.length > 2 ? (
-                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-700">
-                  +{documents.length - 2} 份
-                </span>
+              </div>
+
+              <div className="grid gap-1.5">
+                {documents.slice(0, 2).map((document) => (
+                  <div
+                    key={document.id}
+                    className="flex min-w-0 items-center justify-between gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs"
+                    title={`${document.name} · ${formatBytes(document.size)}`}
+                  >
+                    <span className="truncate font-medium text-slate-700">{document.name}</span>
+                    <span className="shrink-0 text-slate-400">{formatBytes(document.size)}</span>
+                  </div>
+                ))}
+                {documents.length > 2 ? (
+                  <div className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">
+                    另有 {documents.length - 2} 份文件
+                  </div>
+                ) : null}
+              </div>
+
+              {matchedFieldNames.length > 0 ? (
+                <div className="flex flex-wrap gap-1.5">
+                  {matchedFieldNames.slice(0, 4).map((label) => (
+                    <span
+                      key={label}
+                      className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700"
+                    >
+                      {label}
+                    </span>
+                  ))}
+                  {matchedFieldNames.length > 4 ? (
+                    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600">
+                      +{matchedFieldNames.length - 4}
+                    </span>
+                  ) : null}
+                </div>
+              ) : latestDocument?.parseNote ? (
+                <p className="line-clamp-2 text-xs leading-5 text-slate-500">
+                  {latestDocument.parseNote}
+                </p>
               ) : null}
             </div>
           ) : (
-            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-              <span className="inline-flex rounded-full bg-slate-100 px-2 py-0.5 font-medium text-slate-600">
-                未上传
-              </span>
-              <span>支持 PDF、图片、TXT、CSV、Markdown、JSON。</span>
+            <div className="mt-3 rounded-xl border border-dashed border-slate-200 bg-slate-50 px-3 py-3 text-xs leading-5 text-slate-500">
+              支持 PDF、图片、TXT、CSV、Markdown、JSON。章程类文件会额外识别注册地址和股本条款。
             </div>
           )}
         </div>
@@ -465,7 +785,7 @@ function MaterialRequirementCell({
             {generatedReady ? "已生成" : "系统生成"}
           </span>
         ) : (
-          <div className="flex shrink-0 items-center gap-2 xl:self-start">
+          <div className="flex shrink-0 items-center gap-2">
             <button
               type="button"
               onClick={() => inputRef.current?.click()}
@@ -592,6 +912,8 @@ export default function Home() {
   const [findings, setFindings] = useState<PrefillFinding[]>([]);
   const [uploadingRequirement, setUploadingRequirement] =
     useState<MaterialRequirementKey | null>(null);
+  const [uploadProcessing, setUploadProcessing] =
+    useState<UploadProcessingState | null>(null);
   const [isExtracting, setIsExtracting] = useState(false);
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
   const [isSavingDraft, setIsSavingDraft] = useState(false);
@@ -688,6 +1010,21 @@ export default function Home() {
 
     return map;
   }, [documents]);
+  const findingsByRequirementKey = useMemo(() => {
+    const map = new Map<MaterialRequirementKey, PrefillFinding[]>();
+
+    for (const finding of findings) {
+      if (!finding.requirementKey) {
+        continue;
+      }
+
+      const items = map.get(finding.requirementKey) ?? [];
+      items.push(finding);
+      map.set(finding.requirementKey, items);
+    }
+
+    return map;
+  }, [findings]);
 
   const companyRegion = useMemo(
     () => deriveCompanyIncorporationRegion(formValues, { findings, documents }),
@@ -928,13 +1265,31 @@ export default function Home() {
     setIsExtracting(true);
     setErrorMessage("");
     setStatusMessage(`正在接收 ${requirement.label}`);
+    setUploadProcessing({
+      requirementKey: requirement.key,
+      requirementLabel: requirement.label,
+      currentIndex: 1,
+      total: selectedFiles.length,
+      fileName: selectedFiles[0]?.name ?? requirement.label,
+      phase: "extracting",
+    });
 
     try {
-      let nextValues = formValues;
       const nextDocuments: UploadedDocument[] = [];
       const nextFindings: PrefillFinding[] = [];
 
-      for (const file of selectedFiles) {
+      for (const [index, file] of selectedFiles.entries()) {
+        setUploadProcessing({
+          requirementKey: requirement.key,
+          requirementLabel: requirement.label,
+          currentIndex: index + 1,
+          total: selectedFiles.length,
+          fileName: file.name,
+          phase: "extracting",
+        });
+        setStatusMessage(
+          `正在读取 ${requirement.label}：${index + 1}/${selectedFiles.length} ${file.name}`,
+        );
         const result = await extractDocumentDataWithContext(file, {
           kind: "supporting",
           requirementKey: requirement.key,
@@ -942,7 +1297,6 @@ export default function Home() {
         });
         nextDocuments.push(result.document);
         nextFindings.push(...result.findings);
-        nextValues = mergePatchIntoValues(nextValues, result.patch);
       }
 
       const mergedDocuments = [
@@ -953,6 +1307,11 @@ export default function Home() {
         ...findings.filter((finding) => finding.requirementKey !== requirement.key),
         ...nextFindings,
       ];
+      const nextValues = applyPrefillFindingsToValues(
+        formValues,
+        findings,
+        mergedFindings,
+      );
 
       setDocuments(mergedDocuments);
       setFindings(mergedFindings);
@@ -961,6 +1320,14 @@ export default function Home() {
 
       if (backendReady) {
         setStatusMessage(`已接收 ${requirement.label}，正在写入 Supabase`);
+        setUploadProcessing({
+          requirementKey: requirement.key,
+          requirementLabel: requirement.label,
+          currentIndex: selectedFiles.length,
+          total: selectedFiles.length,
+          fileName: selectedFiles.at(-1)?.name ?? requirement.label,
+          phase: "saving",
+        });
 
         const response = await uploadSubmissionDocuments({
           files: selectedFiles,
@@ -999,6 +1366,7 @@ export default function Home() {
     } finally {
       setIsExtracting(false);
       setUploadingRequirement(null);
+      setUploadProcessing(null);
       input.value = "";
     }
   };
@@ -1010,9 +1378,15 @@ export default function Home() {
     const nextFindings = findings.filter(
       (finding) => finding.requirementKey !== requirement.key,
     );
+    const nextValues = applyPrefillFindingsToValues(
+      formValues,
+      findings,
+      nextFindings,
+    );
 
     setDocuments(nextDocuments);
     setFindings(nextFindings);
+    setFormValues(nextValues);
     setHasUnsavedChanges(true);
     setStatusMessage(`已清空 ${requirement.label}`);
     setErrorMessage("");
@@ -1024,6 +1398,7 @@ export default function Home() {
     const submission = await persistDraft("draft", {
       documents: nextDocuments,
       findings: nextFindings,
+      formValues: nextValues,
     });
 
     if (submission) {
@@ -1331,6 +1706,51 @@ export default function Home() {
 
     return Array.from(map.entries());
   }, [findings]);
+  const fieldDecisions = useMemo(() => buildPrefillFieldDecisions(findings), [findings]);
+  const priorityFieldSnapshots = useMemo(
+    () =>
+      priorityPrefillFields.map((item) => {
+        const decision = fieldDecisions.find((entry) => entry.field === item.field);
+        const value = formValues[item.field];
+        return {
+          ...item,
+          value: typeof value === "string" ? value : "",
+          decision,
+        };
+      }),
+    [fieldDecisions, formValues],
+  );
+  const registeredAddressDecision = useMemo(
+    () => fieldDecisions.find((decision) => decision.field === "registeredAddress"),
+    [fieldDecisions],
+  );
+  const highConfidenceDecisionCount = useMemo(
+    () => fieldDecisions.filter((decision) => decision.selectedScore >= 80).length,
+    [fieldDecisions],
+  );
+  const reviewDecisionCount = useMemo(
+    () =>
+      fieldDecisions.filter(
+        (decision) =>
+          decision.selectedScore < 80 ||
+          decision.candidates.some(
+            (candidate) =>
+              !candidate.selected &&
+              Math.abs(candidate.score - decision.selectedScore) <= 12,
+          ),
+      ).length,
+    [fieldDecisions],
+  );
+  const uploadedDocumentsWithFindings = useMemo(
+    () =>
+      documents.map((document) => ({
+        document,
+        findings: document.requirementKey
+          ? findingsByRequirementKey.get(document.requirementKey) ?? []
+          : [],
+      })),
+    [documents, findingsByRequirementKey],
+  );
 
   const metricCards = [
     {
@@ -1372,7 +1792,7 @@ export default function Home() {
                   把公司开户材料整理成一条完整的电子化提交链路
                 </h1>
                 <p className="max-w-3xl text-sm leading-7 text-slate-600 sm:text-[15px]">
-                  客户先上传所有支持文件，系统对可读取资料做自动摘取并预填写；客户再检查和补全开户表；随后生成与原始 PDF 一致的申请文件供检查、签字；最后把签署版申请文件和全部支持文件一起发送到后台。
+                  客户先上传所有支持文件，系统对可读取资料做自动摘取并预填写；公司章程、注册证书、商业登记等公司文件会优先识别公司名称、注册日期、注册地址及股本信息；客户再检查和补全开户表；随后生成与原始 PDF 一致的申请文件供检查、签字；最后把签署版申请文件和全部支持文件一起发送到后台。
                 </p>
               </div>
 
@@ -1545,25 +1965,167 @@ export default function Home() {
                   body="这一阶段只上传支持文件，不上传最终开户申请表。开户申请表会在客户检查、补全并签字后由系统生成，并自动并入最终材料包。"
                 />
 
-                <div className="mt-6 grid gap-4">
-                  <div className="rounded-2xl border border-slate-200 bg-[linear-gradient(135deg,rgba(255,255,255,0.92),rgba(245,247,250,0.96))] px-5 py-5">
-                    <div className="flex items-start gap-4">
-                      <span className="inline-flex h-12 w-12 items-center justify-center rounded-xl bg-emerald-100 text-emerald-700">
-                        <Building2 className="h-5 w-5" />
-                      </span>
-                      <div>
-                        <h3 className="text-lg font-semibold text-slate-950">材料上传规则</h3>
-                        <p className="mt-2 text-sm leading-7 text-slate-600">
-                          支持文件按清单逐项上传即可。桌面端按左右两栏横向排列，尽量贴近原始材料清单；手机端会自动折成上下结构。文字型 PDF、TXT、CSV、JSON 会直接读取文本；扫描版 PDF、照片和截图会额外尝试 OCR 自动摘取。
-                        </p>
-                        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
-                          <span
-                            className={`inline-flex rounded-full px-2.5 py-1 font-medium ${companyRegionMeta.className}`}
-                          >
-                            {companyRegionMeta.label}
-                          </span>
-                          <span className="text-slate-500">{companyRegionMeta.note}</span>
+                <div className="mt-6 grid gap-5">
+                  <div className="grid gap-4 xl:grid-cols-[1.08fr_0.92fr]">
+                    <div className="rounded-2xl border border-slate-200 bg-white px-5 py-5">
+                      <div className="flex flex-wrap items-start justify-between gap-4">
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <span className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-slate-950 text-white">
+                              <Upload className="h-4 w-4" />
+                            </span>
+                            <div>
+                              <h3 className="text-base font-semibold text-slate-950">
+                                上传控制台
+                              </h3>
+                              <p className="mt-1 text-xs text-slate-500">
+                                上传后立即读取文字型 PDF；扫描 PDF 和图片会自动走 OCR。
+                              </p>
+                            </div>
+                          </div>
                         </div>
+                        <span
+                          className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${companyRegionMeta.className}`}
+                        >
+                          {companyRegionMeta.label}
+                        </span>
+                      </div>
+
+                      <div className="mt-5 grid gap-3 sm:grid-cols-3">
+                        <div className="rounded-xl bg-slate-50 px-4 py-4">
+                          <p className="text-xs font-medium text-slate-500">必需材料</p>
+                          <p className="mt-2 text-2xl font-semibold text-slate-950">
+                            {uploadedRequirementCount}/{requiredUploadRequirements.length}
+                          </p>
+                        </div>
+                        <div className="rounded-xl bg-slate-50 px-4 py-4">
+                          <p className="text-xs font-medium text-slate-500">已收文件</p>
+                          <p className="mt-2 text-2xl font-semibold text-slate-950">
+                            {documents.length}
+                          </p>
+                        </div>
+                        <div className="rounded-xl bg-slate-50 px-4 py-4">
+                          <p className="text-xs font-medium text-slate-500">自动命中</p>
+                          <p className="mt-2 text-2xl font-semibold text-slate-950">
+                            {extractedFieldCount}
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-4">
+                        {uploadProcessing ? (
+                          <div>
+                            <div className="flex items-center justify-between gap-3">
+                              <div className="min-w-0">
+                                <p className="truncate text-sm font-semibold text-slate-900">
+                                  {uploadProcessing.phase === "saving"
+                                    ? "正在写入 Supabase"
+                                    : "正在自动读取资料"}
+                                </p>
+                                <p className="mt-1 truncate text-xs text-slate-500">
+                                  {uploadProcessing.requirementLabel} ·{" "}
+                                  {uploadProcessing.currentIndex}/{uploadProcessing.total} ·{" "}
+                                  {uploadProcessing.fileName}
+                                </p>
+                              </div>
+                              <LoaderCircle className="h-4 w-4 shrink-0 animate-spin text-amber-500" />
+                            </div>
+                            <div className="mt-3 h-2 overflow-hidden rounded-full bg-white">
+                              <div
+                                className="h-full rounded-full bg-amber-400 transition-all"
+                                style={{
+                                  width: `${
+                                    uploadProcessing.phase === "saving"
+                                      ? 92
+                                      : Math.max(
+                                          12,
+                                          Math.round(
+                                            (uploadProcessing.currentIndex /
+                                              uploadProcessing.total) *
+                                              76,
+                                          ),
+                                        )
+                                  }%`,
+                                }}
+                              />
+                            </div>
+                          </div>
+                        ) : missingRequiredUploadRequirements.length > 0 ? (
+                          <div>
+                            <p className="text-sm font-semibold text-slate-900">
+                              仍有 {missingRequiredUploadRequirements.length} 项必需材料未上传
+                            </p>
+                            <div className="mt-2 flex flex-wrap gap-2">
+                              {missingRequiredUploadRequirements.slice(0, 4).map((item) => (
+                                <span
+                                  key={item.key}
+                                  className="rounded-full bg-white px-2.5 py-1 text-[11px] font-medium text-slate-600 ring-1 ring-slate-200"
+                                >
+                                  {item.label}
+                                </span>
+                              ))}
+                              {missingRequiredUploadRequirements.length > 4 ? (
+                                <span className="rounded-full bg-white px-2.5 py-1 text-[11px] font-medium text-slate-600 ring-1 ring-slate-200">
+                                  +{missingRequiredUploadRequirements.length - 4}
+                                </span>
+                              ) : null}
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-2 text-sm font-semibold text-emerald-700">
+                            <CheckCircle2 className="h-4 w-4" />
+                            必需材料已上传齐全，可以进入自动摘取复核。
+                          </div>
+                        )}
+                      </div>
+
+                      <p className="mt-4 text-xs leading-5 text-slate-500">
+                        章程类文件会额外读取标题页、注册代理地址块和股本条款；如果注册地址仍异常，请在下一步查看“注册地址校准”候选。
+                      </p>
+                    </div>
+
+                    <div className="rounded-2xl border border-slate-200 bg-slate-950 px-5 py-5 text-white">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <h3 className="text-base font-semibold">关键字段预览</h3>
+                          <p className="mt-1 text-xs leading-5 text-white/58">
+                            上传章程、注册证书后，这里应优先出现公司名、注册地址、注册日期和股本。
+                          </p>
+                        </div>
+                        <span className="rounded-full bg-white/10 px-2.5 py-1 text-[11px] font-medium text-white/70">
+                          {priorityFieldSnapshots.filter((item) => item.value).length}/
+                          {priorityFieldSnapshots.length}
+                        </span>
+                      </div>
+
+                      <div className="mt-4 grid gap-3">
+                        {priorityFieldSnapshots.map((item) => (
+                          <div
+                            key={item.field}
+                            className="rounded-xl border border-white/10 bg-white/[0.06] px-4 py-3"
+                          >
+                            <div className="flex items-center justify-between gap-3">
+                              <p className="text-xs font-semibold text-white/72">{item.label}</p>
+                              {item.decision ? (
+                                <span className="rounded-full bg-emerald-400/15 px-2 py-0.5 text-[11px] font-medium text-emerald-200">
+                                  分数 {item.decision.selectedScore}
+                                </span>
+                              ) : null}
+                            </div>
+                            <p
+                              className={`mt-1 break-words text-sm leading-6 ${
+                                item.value ? "text-white" : "text-white/38"
+                              }`}
+                            >
+                              {item.value || item.emptyHint}
+                            </p>
+                            {item.decision?.selectedRequirementLabel ? (
+                              <p className="mt-1 text-[11px] text-white/42">
+                                来源：{item.decision.selectedRequirementLabel}
+                              </p>
+                            ) : null}
+                          </div>
+                        ))}
                       </div>
                     </div>
                   </div>
@@ -1589,8 +2151,10 @@ export default function Home() {
                               <MaterialRequirementCell
                                 requirement={row.left}
                                 documents={documentsByRequirement.get(row.left.key) ?? []}
+                                findings={findingsByRequirementKey.get(row.left.key) ?? []}
                                 generatedReady={signedReady}
                                 uploading={uploadingRequirement === row.left.key}
+                                processing={uploadProcessing}
                                 onUpload={(event) => {
                                   void handleRequirementUpload(row.left, event);
                                 }}
@@ -1608,8 +2172,10 @@ export default function Home() {
                               <MaterialRequirementCell
                                 requirement={row.right}
                                 documents={documentsByRequirement.get(row.right.key) ?? []}
+                                findings={findingsByRequirementKey.get(row.right.key) ?? []}
                                 generatedReady={signedReady}
                                 uploading={uploadingRequirement === row.right.key}
+                                processing={uploadProcessing}
                                 onUpload={(event) => {
                                   void handleRequirementUpload(row.right, event);
                                 }}
@@ -1653,25 +2219,30 @@ export default function Home() {
                       </div>
                       <div className="rounded-2xl border border-slate-200 bg-white px-4 py-4">
                         <p className="text-xs font-medium uppercase tracking-[0.12em] text-slate-500">
-                          可预填字段
+                          高可信字段
                         </p>
                         <p className="mt-2 text-2xl font-semibold text-slate-950">
-                          {extractedFieldCount}
+                          {highConfidenceDecisionCount}
                         </p>
                         <p className="mt-1 text-xs text-slate-500">
-                          来源于 {findingsByRequirement.length} 类资料
+                          自动评分达到 80 以上
                         </p>
                       </div>
                       <div className="rounded-2xl border border-slate-200 bg-white px-4 py-4">
                         <p className="text-xs font-medium uppercase tracking-[0.12em] text-slate-500">
-                          人工补录
+                          待复核字段
                         </p>
                         <p className="mt-2 text-2xl font-semibold text-slate-950">
-                          {missingItems.length}
+                          {reviewDecisionCount}
                         </p>
-                        <p className="mt-1 text-xs text-slate-500">后续在检查补全步骤完成</p>
+                        <p className="mt-1 text-xs text-slate-500">候选接近或分数偏低</p>
                       </div>
                     </div>
+
+                    <RegisteredAddressCalibrationCard
+                      decision={registeredAddressDecision}
+                      currentValue={formValues.registeredAddress}
+                    />
 
                     <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-3">
                       <span
@@ -1729,6 +2300,31 @@ export default function Home() {
                         </div>
                       )}
                     </div>
+
+                    <div className="rounded-2xl border border-slate-200 bg-white px-5 py-5">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <h3 className="text-sm font-semibold text-slate-900">识别决策</h3>
+                          <p className="mt-1 text-xs leading-5 text-slate-500">
+                            展示每个字段最终为什么选中当前值，以及候选来源和评分。
+                          </p>
+                        </div>
+                        <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-medium text-slate-600">
+                          {fieldDecisions.length} 个字段
+                        </span>
+                      </div>
+                      {fieldDecisions.length === 0 ? (
+                        <div className="mt-4 rounded-xl border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-sm text-slate-500">
+                          还没有可展示的字段决策。
+                        </div>
+                      ) : (
+                        <div className="mt-4 grid gap-3">
+                          {fieldDecisions.map((decision) => (
+                            <PrefillDecisionCard key={decision.field} decision={decision} />
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   </div>
 
                   <div className="grid gap-4">
@@ -1749,7 +2345,7 @@ export default function Home() {
                             还没有上传资料。
                           </div>
                         ) : (
-                          documents.map((document) => (
+                          uploadedDocumentsWithFindings.map(({ document, findings }) => (
                             <div
                               key={document.id}
                               className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-4"
@@ -1781,10 +2377,30 @@ export default function Home() {
                                   </span>
                                 ) : null}
                                 <span className="inline-flex rounded-full bg-white px-2 py-0.5 font-medium text-slate-600 ring-1 ring-slate-200">
-                                  命中 {document.matchedFieldCount ?? 0} 项
+                                  命中 {findings.length || document.matchedFieldCount || 0} 项
                                 </span>
                                 <span className="leading-5">{document.parseNote}</span>
                               </div>
+                              {findings.length > 0 ? (
+                                <div className="mt-3 flex flex-wrap gap-1.5">
+                                  {Array.from(new Set(findings.map((finding) => finding.label)))
+                                    .slice(0, 6)
+                                    .map((label) => (
+                                      <span
+                                        key={label}
+                                        className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700"
+                                      >
+                                        {label}
+                                      </span>
+                                    ))}
+                                  {new Set(findings.map((finding) => finding.label)).size > 6 ? (
+                                    <span className="rounded-full bg-white px-2 py-0.5 text-[11px] font-medium text-slate-600 ring-1 ring-slate-200">
+                                      +
+                                      {new Set(findings.map((finding) => finding.label)).size - 6}
+                                    </span>
+                                  ) : null}
+                                </div>
+                              ) : null}
                               {document.extractedTextSample ? (
                                 <div className="mt-2 rounded-lg bg-white px-3 py-2">
                                   <p className="text-[11px] font-medium uppercase tracking-[0.12em] text-slate-400">
@@ -3076,7 +3692,7 @@ export default function Home() {
                 <h3 className="text-sm font-semibold text-slate-900">当前实现边界</h3>
               </div>
               <ul className="mt-3 grid gap-3 text-sm leading-6 text-slate-600">
-                <li>文字型资料会优先参与自动摘取；图片类资料当前版本先做原件保存与归档展示。</li>
+                <li>文字型资料会优先参与自动摘取；扫描版 PDF、照片和截图也会尝试 OCR，章程类文件会额外抽取公司名称、注册日期、注册地址和股本信息。</li>
                 <li>最终发送到后台的主文件是系统生成的签署版 PDF，不需要客户在第一步上传。</li>
                 <li>支持文件、草稿状态、复核版和签署版 PDF 都会同步到 Supabase。</li>
               </ul>

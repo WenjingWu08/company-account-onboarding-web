@@ -185,6 +185,30 @@ export type PrefillFinding = {
   source: string;
   requirementKey?: MaterialRequirementKey | null;
   requirementLabel?: string | null;
+  strategy?: string | null;
+};
+
+export type PrefillFieldDecisionCandidate = {
+  field: keyof CompanyAccountFormValues;
+  label: string;
+  value: string;
+  source: string;
+  requirementKey?: MaterialRequirementKey | null;
+  requirementLabel?: string | null;
+  strategy?: string | null;
+  score: number;
+  selected: boolean;
+};
+
+export type PrefillFieldDecision = {
+  field: keyof CompanyAccountFormValues;
+  label: string;
+  selectedValue: string;
+  selectedSource: string;
+  selectedRequirementLabel?: string | null;
+  selectedStrategy?: string | null;
+  selectedScore: number;
+  candidates: PrefillFieldDecisionCandidate[];
 };
 
 export type StepId = "upload" | "company" | "funding" | "review" | "sign";
