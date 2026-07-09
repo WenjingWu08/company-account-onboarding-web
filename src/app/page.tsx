@@ -923,6 +923,7 @@ export default function Home() {
   const [statusMessage, setStatusMessage] = useState("等待上传支持文件");
   const [errorMessage, setErrorMessage] = useState("");
   const [signaturePreview, setSignaturePreview] = useState<string | null>(null);
+  const [pdfDirty, setPdfDirty] = useState(false);
   const [submissionId, setSubmissionId] = useState<string | null>(null);
   const [submissionRecord, setSubmissionRecord] = useState<SubmissionRecord | null>(null);
   const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
@@ -947,6 +948,39 @@ export default function Home() {
       }
     };
   }, [reviewPdfUrl, signedPdfUrl]);
+
+  const clearSignedOutput = () => {
+    setSignedPdfUrl((current) => {
+      if (current) {
+        URL.revokeObjectURL(current);
+      }
+      return null;
+    });
+    setSignaturePreview(null);
+    signatureRef.current?.clear();
+  };
+
+  const invalidateGeneratedOutputs = () => {
+    const hadGeneratedOutput = Boolean(
+      reviewPdfUrl ||
+        signedPdfUrl ||
+        submissionRecord?.latestReviewPdfPath ||
+        submissionRecord?.latestSignedPdfPath,
+    );
+
+    setReviewPdfUrl((current) => {
+      if (current) {
+        URL.revokeObjectURL(current);
+      }
+      return null;
+    });
+    clearSignedOutput();
+    setPdfDirty(true);
+
+    if (hadGeneratedOutput && !pdfDirty) {
+      setStatusMessage("内容已更新，请重新生成复核版 PDF 后再签字。");
+    }
+  };
 
   const applySubmissionRecord = useCallback((submission: SubmissionRecord) => {
     setSubmissionRecord(submission);
@@ -1090,14 +1124,11 @@ export default function Home() {
     () => new Set(findings.map((finding) => finding.field)).size,
     [findings],
   );
-  const reviewReady = Boolean(reviewPdfUrl || submissionRecord?.latestReviewPdfPath);
+  const reviewReady = Boolean(reviewPdfUrl) && !pdfDirty;
   const signedReady = Boolean(
-    signedPdfUrl ||
-      submissionRecord?.latestSignedPdfPath ||
-      submissionRecord?.status === "signed" ||
-      submissionRecord?.status === "submitted",
+    !pdfDirty && formValues.clientReviewConfirmed && signedPdfUrl,
   );
-  const packageSubmitted = submissionRecord?.status === "submitted";
+  const packageSubmitted = submissionRecord?.status === "submitted" && signedReady;
   const companyRegionMeta = useMemo(() => {
     if (companyRegion === "hongKong") {
       return {
@@ -1213,7 +1244,11 @@ export default function Home() {
     setFormValues((current) => ({
       ...current,
       [key]: value,
+      ...(key === "clientReviewConfirmed" ? {} : { clientReviewConfirmed: false }),
     }));
+    if (key !== "clientReviewConfirmed") {
+      invalidateGeneratedOutputs();
+    }
     setHasUnsavedChanges(true);
   };
 
@@ -1223,10 +1258,12 @@ export default function Home() {
   ) => {
     setFormValues((current) => ({
       ...current,
+      clientReviewConfirmed: false,
       authorizedPersons: current.authorizedPersons.map((person, personIndex) =>
         personIndex === index ? { ...person, ...patch } : person,
       ),
     }));
+    invalidateGeneratedOutputs();
     setHasUnsavedChanges(true);
   };
 
@@ -1239,6 +1276,7 @@ export default function Home() {
   ) => {
     setFormValues((current) => ({
       ...current,
+      clientReviewConfirmed: false,
       experiences: {
         ...current.experiences,
         [key]: {
@@ -1247,6 +1285,7 @@ export default function Home() {
         },
       },
     }));
+    invalidateGeneratedOutputs();
     setHasUnsavedChanges(true);
   };
 
@@ -1307,15 +1346,15 @@ export default function Home() {
         ...findings.filter((finding) => finding.requirementKey !== requirement.key),
         ...nextFindings,
       ];
-      const nextValues = applyPrefillFindingsToValues(
-        formValues,
-        findings,
-        mergedFindings,
-      );
+      const nextValues = {
+        ...applyPrefillFindingsToValues(formValues, findings, mergedFindings),
+        clientReviewConfirmed: false,
+      };
 
       setDocuments(mergedDocuments);
       setFindings(mergedFindings);
       setFormValues(nextValues);
+      invalidateGeneratedOutputs();
       setHasUnsavedChanges(true);
 
       if (backendReady) {
@@ -1378,15 +1417,15 @@ export default function Home() {
     const nextFindings = findings.filter(
       (finding) => finding.requirementKey !== requirement.key,
     );
-    const nextValues = applyPrefillFindingsToValues(
-      formValues,
-      findings,
-      nextFindings,
-    );
+    const nextValues = {
+      ...applyPrefillFindingsToValues(formValues, findings, nextFindings),
+      clientReviewConfirmed: false,
+    };
 
     setDocuments(nextDocuments);
     setFindings(nextFindings);
     setFormValues(nextValues);
+    invalidateGeneratedOutputs();
     setHasUnsavedChanges(true);
     setStatusMessage(`已清空 ${requirement.label}`);
     setErrorMessage("");
@@ -1409,6 +1448,18 @@ export default function Home() {
 
   const generatePdf = async (mode: "review" | "final") => {
     if (mode === "final") {
+      if (!reviewReady) {
+        setErrorMessage("请先生成复核版 PDF，并让客户检查无误后再签字。");
+        setActiveStep("review");
+        return;
+      }
+
+      if (!formValues.clientReviewConfirmed) {
+        setErrorMessage("请先勾选客户已核对复核版 PDF，确认无误后再生成签署版。");
+        setActiveStep("review");
+        return;
+      }
+
       const reviewValidation = getStepValidationMessage("review", formValues);
       if (reviewValidation) {
         setErrorMessage(reviewValidation);
@@ -1436,6 +1487,10 @@ export default function Home() {
     setStatusMessage(mode === "review" ? "正在生成复核版 PDF" : "正在生成签署版 PDF");
 
     try {
+      const pdfValues =
+        mode === "review"
+          ? { ...formValues, clientReviewConfirmed: false }
+          : formValues;
       const signatureDataUrl =
         mode === "final" ? signatureRef.current?.toDataUrl() ?? null : null;
       if (mode === "final") {
@@ -1443,12 +1498,15 @@ export default function Home() {
       }
 
       const blob = await generateCompanyAccountPdf({
-        values: formValues,
+        values: pdfValues,
         signatureDataUrl,
       });
       const objectUrl = URL.createObjectURL(blob);
 
       if (mode === "review") {
+        setFormValues(pdfValues);
+        clearSignedOutput();
+        setPdfDirty(false);
         setReviewPdfUrl((current) => {
           if (current) {
             URL.revokeObjectURL(current);
@@ -1456,6 +1514,7 @@ export default function Home() {
           return objectUrl;
         });
       } else {
+        setPdfDirty(false);
         setSignedPdfUrl((current) => {
           if (current) {
             URL.revokeObjectURL(current);
@@ -1466,7 +1525,8 @@ export default function Home() {
 
       if (backendReady) {
         const draftSubmission =
-          (await persistDraft(deriveSubmissionStatus(mode))) ?? submissionRecord;
+          (await persistDraft(deriveSubmissionStatus(mode), { formValues: pdfValues })) ??
+          submissionRecord;
 
         if (draftSubmission?.id) {
           const uploadResult = await uploadSubmissionPdf({
@@ -1492,7 +1552,7 @@ export default function Home() {
       }
 
       if (mode === "review") {
-        setStatusMessage("复核版已生成，可先检查，如无误再签字导出签署版。");
+        setStatusMessage("复核版已生成，请客户检查并确认无误后再签字。");
       } else {
         setStatusMessage("签署版已生成，下一步可确认完整材料包并发送后台。");
         setActiveStep("sign");
@@ -1626,8 +1686,11 @@ export default function Home() {
       if (signedReady) {
         return "签署版申请文件已生成，可以进入最终确认发送。";
       }
+      if (reviewReady && formValues.clientReviewConfirmed) {
+        return "客户已确认复核版无误，可以完成电子签名并生成签署版 PDF。";
+      }
       if (reviewReady) {
-        return "复核版已生成，确认无误后请签字并导出签署版。";
+        return "复核版已生成，请客户检查并勾选确认后再签字。";
       }
       return "请先生成复核版，再完成电子签名与签署版导出。";
     }
@@ -1646,6 +1709,24 @@ export default function Home() {
     signedReady,
     uploadedRequirementCount,
   ]);
+
+  const handleReviewConfirmationChange = (checked: boolean) => {
+    if (checked && !reviewReady) {
+      setErrorMessage("请先生成复核版 PDF，再确认客户已核对。");
+      return;
+    }
+
+    updateField("clientReviewConfirmed", checked);
+    setErrorMessage("");
+
+    if (checked) {
+      setStatusMessage("客户已确认复核版无误，可以电子签名。");
+      return;
+    }
+
+    clearSignedOutput();
+    setStatusMessage("已取消复核确认；如需签署，请客户重新确认复核版。");
+  };
 
   const jumpToNextStep = () => {
     if (activeStep === "upload") {
@@ -1751,6 +1832,7 @@ export default function Home() {
       })),
     [documents, findingsByRequirementKey],
   );
+  const canCaptureSignature = reviewReady && formValues.clientReviewConfirmed;
 
   const metricCards = [
     {
@@ -3064,6 +3146,71 @@ export default function Home() {
                   body="先生成复核版 PDF 供客户检查；发现问题时可直接返回上一步修改。确认无误后，在这里完成电子签名并导出签署版 PDF。"
                 />
 
+                <div className="mt-5 grid gap-3 md:grid-cols-4">
+                  {[
+                    {
+                      label: "复核版 PDF",
+                      done: reviewReady,
+                      icon: FileSearch,
+                      hint: reviewReady ? "已生成" : "待生成",
+                    },
+                    {
+                      label: "客户确认",
+                      done: formValues.clientReviewConfirmed,
+                      icon: ClipboardCheck,
+                      hint: formValues.clientReviewConfirmed ? "已核对" : "待核对",
+                    },
+                    {
+                      label: "电子签名",
+                      done: Boolean(signaturePreview),
+                      icon: PenSquare,
+                      hint: signaturePreview ? "已签名" : "待签名",
+                    },
+                    {
+                      label: "签署版 PDF",
+                      done: signedReady,
+                      icon: ShieldCheck,
+                      hint: signedReady ? "已生成" : "待生成",
+                    },
+                  ].map((item) => {
+                    const Icon = item.icon;
+                    return (
+                      <div
+                        key={item.label}
+                        className={`rounded-xl border px-4 py-3 ${
+                          item.done
+                            ? "border-emerald-200 bg-emerald-50"
+                            : "border-slate-200 bg-white"
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <span
+                            className={`inline-flex h-9 w-9 items-center justify-center rounded-lg ${
+                              item.done
+                                ? "bg-emerald-600 text-white"
+                                : "bg-slate-100 text-slate-500"
+                            }`}
+                          >
+                            <Icon className="h-4 w-4" />
+                          </span>
+                          <span
+                            className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${
+                              item.done
+                                ? "bg-white text-emerald-700"
+                                : "bg-slate-100 text-slate-500"
+                            }`}
+                          >
+                            {item.hint}
+                          </span>
+                        </div>
+                        <p className="mt-3 text-sm font-semibold text-slate-900">
+                          {item.label}
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+
                 <div className="mt-6 grid gap-6 xl:grid-cols-[0.96fr_1.04fr]">
                   <div className="grid gap-4">
                     <div className="rounded-2xl border border-slate-200 bg-white px-5 py-5">
@@ -3164,6 +3311,38 @@ export default function Home() {
                           </a>
                         ) : null}
                       </div>
+
+                      <div
+                        className={`mt-4 rounded-xl border px-4 py-4 ${
+                          reviewReady
+                            ? "border-emerald-200 bg-emerald-50"
+                            : "border-slate-200 bg-slate-50"
+                        }`}
+                      >
+                        <label
+                          className={`flex items-start gap-3 ${
+                            reviewReady ? "cursor-pointer" : "cursor-not-allowed opacity-65"
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            className="mt-1 h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                            checked={formValues.clientReviewConfirmed}
+                            disabled={!reviewReady}
+                            onChange={(event) =>
+                              handleReviewConfirmationChange(event.target.checked)
+                            }
+                          />
+                          <span>
+                            <span className="block text-sm font-semibold text-slate-900">
+                              客户已核对复核版 PDF，确认内容无误
+                            </span>
+                            <span className="mt-1 block text-xs leading-5 text-slate-600">
+                              勾选后才会开放电子签字板；如返回修改资料，需要重新生成复核版并再次确认。
+                            </span>
+                          </span>
+                        </label>
+                      </div>
                     </div>
 
                     <div className="grid gap-4 rounded-2xl border border-slate-200 bg-white px-5 py-5 md:grid-cols-2">
@@ -3238,7 +3417,9 @@ export default function Home() {
                         <div>
                           <h3 className="text-sm font-semibold text-slate-900">电子签字板</h3>
                           <p className="mt-1 text-xs text-slate-500">
-                            这份签名会落到最终签署版申请文件中。
+                            {canCaptureSignature
+                              ? "这份签名会落到最终签署版申请文件中。"
+                              : "请先生成复核版 PDF，并由客户确认无误。"}
                           </p>
                         </div>
                         <button
@@ -3254,14 +3435,30 @@ export default function Home() {
                         </button>
                       </div>
 
-                      <div className="mt-4 overflow-hidden rounded-2xl border border-slate-200 bg-[linear-gradient(180deg,#fffef9_0%,#fff8ee_100%)]">
+                      <div className="relative mt-4 overflow-hidden rounded-2xl border border-slate-200 bg-[linear-gradient(180deg,#fffef9_0%,#fff8ee_100%)]">
                         <SignatureCapture
                           ref={signatureRef}
                           onEnd={() => {
+                            if (!canCaptureSignature) {
+                              signatureRef.current?.clear();
+                              return;
+                            }
                             setSignaturePreview(signatureRef.current?.toDataUrl() ?? null);
                             setStatusMessage("签名已捕捉，可生成签署版 PDF。");
                           }}
                         />
+                        {!canCaptureSignature ? (
+                          <div className="absolute inset-0 flex items-center justify-center bg-white/82 px-5 text-center backdrop-blur-[1px]">
+                            <div>
+                              <p className="text-sm font-semibold text-slate-900">
+                                等待客户确认复核版
+                              </p>
+                              <p className="mt-1 text-xs leading-5 text-slate-500">
+                                复核版 PDF 生成并确认无误后，签字板会自动开放。
+                              </p>
+                            </div>
+                          </div>
+                        ) : null}
                       </div>
 
                       <div className="mt-3 flex items-center justify-between rounded-xl bg-slate-50 px-4 py-3">
@@ -3283,7 +3480,7 @@ export default function Home() {
                           onClick={() => {
                             void generatePdf("final");
                           }}
-                          disabled={isGeneratingPdf}
+                          disabled={isGeneratingPdf || !canCaptureSignature || !signaturePreview}
                           className="inline-flex items-center gap-2 rounded-full bg-emerald-600 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-slate-400"
                         >
                           {isGeneratingPdf ? (

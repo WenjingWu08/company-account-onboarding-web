@@ -158,6 +158,7 @@ export type CompanyAccountFormValues = {
   witnessCompanyName: string;
   witnessCompanyAddress: string;
   declarationDate: string;
+  clientReviewConfirmed: boolean;
   reviewNotes: string;
 };
 
@@ -538,6 +539,7 @@ export const initialCompanyAccountFormValues: CompanyAccountFormValues = {
   witnessCompanyName: "",
   witnessCompanyAddress: "",
   declarationDate: "",
+  clientReviewConfirmed: false,
   reviewNotes: "",
 };
 
